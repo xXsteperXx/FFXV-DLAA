@@ -49,6 +49,13 @@ uint32_t shaderHash;
 uint32_t currentWidth = 0;
 uint32_t currentHeight = 0;
 void* mappedConstantBuffer = nullptr;
+// Copy of the game's TAA constants (cbTemporalAA), for the Frame Generation camera.
+// Recognized by its first values: the render size (g_screenSize.xy).
+float taaConstants[64] = {};
+uint32_t taaConstantsCaptureWidth = 0;
+uint32_t taaConstantsCaptureHeight = 0;
+uint64_t taaConstantsSerial = 0;
+uint64_t taaConstantsUsedSerial = 0;
 float jitter[] = { 0.0f, 0.0f };
 bool invokedThisFrame = false;
 bool needReset = false;
@@ -321,7 +328,25 @@ static void DiagOnTAA(uint32_t rtWidth, uint32_t rtHeight) {
     DiagLog(buffer);
 }
 
-static void DiagOnPresent(swapchain* swapchain) {
+static void DiagOnCamera(bool cameraOk) {
+    if (!diagCapturing) {
+        return;
+    }
+    char buffer[300];
+    for (int reg = 0; reg < 13; ++reg) {
+        const float* c = &taaConstants[reg * 4];
+        snprintf(buffer, sizeof(buffer), "[DLAA-DIAG]      TAA constants c%d = %.6g, %.6g, %.6g, %.6g", reg, c[0], c[1], c[2], c[3]);
+        DiagLog(buffer);
+    }
+    const fg::FrameInputs& in = fg::frameInputs;
+    snprintf(buffer, sizeof(buffer),
+        "[DLAA-DIAG]      Frame Generation camera: %s, projection %s, near=%.4g far=%.6g fov=%.3f rad aspect=%.3f depth %s",
+        cameraOk ? "ok" : "NOT FOUND", fg::lastCameraFromGame ? "from the game" : "estimated",
+        in.nearPlane, in.farPlane, in.fov, in.aspect, in.depthInverted ? "inverted" : "not inverted");
+    DiagLog(buffer);
+}
+
+static void DiagOnPresent(uint64_t backBufferHandle) {
     std::lock_guard<std::mutex> lock(diagMutex);
     if (diagCapturing) {
         for (auto& entry : diagPasses) {
@@ -339,7 +364,7 @@ static void DiagOnPresent(swapchain* swapchain) {
         diagPassIndex = 0;
         diagPasses.clear();
         diagIds.clear();
-        diagBackBuffer = swapchain->get_current_back_buffer().handle;
+        diagBackBuffer = backBufferHandle;
         DiagOpenFile();
         std::string backBufferText = DiagTex((ID3D11Resource*)diagBackBuffer);
         char buffer[160];
@@ -363,6 +388,17 @@ static void DiagOnPresent(swapchain* swapchain) {
 // ---------------------------------------------------------------------------
 constexpr uint32_t kUpscaleShaderHash = 0x1B6C8C68;
 std::set<ID3D11PixelShader*> upscaleShaders;
+
+// Frame Generation: the image without HUD. The game draws the HUD on top of the
+// stretched image, then a last pass (pixel shader 0xD92625B9) writes the result to
+// the back buffer. We keep a copy of the stretched image before the HUD, and run that
+// last pass a second time on the copy, so the image without HUD has exactly the
+// same colors as the real back buffer.
+constexpr uint32_t kFinalOutputShaderHash = 0xD92625B9;
+std::set<ID3D11PixelShader*> finalOutputShaders;
+com_ptr<ID3D11Texture2D> hudlessSourceTexture;
+com_ptr<ID3D11ShaderResourceView> hudlessSourceSRV;
+bool hudlessSourceCaptured = false; // this frame
 
 NVSDK_NGX_Parameter* srParameters = nullptr;
 NVSDK_NGX_Handle* srHandle = nullptr;
@@ -656,6 +692,8 @@ void Cleanup() {
     ReleaseBiasedSamplers();
     sceneMipBiasActive = false;
     srDepth.reset();
+    hudlessSourceSRV.reset();
+    hudlessSourceTexture.reset();
 
     prepareMotionVectorShader.reset();
 
@@ -767,6 +805,39 @@ static void drawSettings(reshade::api::effect_runtime*)
     if (bridgeSetting != fg::bridgeRequested) {
         ImGui::TextUnformatted("Restart the game to apply this change.");
     }
+    if (fg::bridgeActive) {
+        bool frameGeneration = fg::frameGenerationEnabled;
+        if (ImGui::Checkbox("DLSS Frame Generation (2x)", &frameGeneration)) {
+            fg::frameGenerationEnabled = frameGeneration;
+            if (frameGeneration) {
+                fg::frameGenerationRetry = true;
+            }
+            reshade::set_config_value(nullptr, "DLAA", "FrameGeneration", frameGeneration);
+        }
+        ImGui::Text("Frame Generation: %s", fg::frameGenerationStatus.load());
+        if (fg::multiFrameCountMax.load() > 0) {
+            ImGui::Text("Driver limit: up to %u generated frame(s) per real frame", fg::multiFrameCountMax.load());
+        }
+        if (ImGui::TreeNode("Frame Generation debug options")) {
+            bool transpose = fg::transposeMatrices;
+            if (ImGui::Checkbox("Transposed camera matrices (default: on)", &transpose)) {
+                fg::transposeMatrices = transpose;
+                reshade::set_config_value(nullptr, "DLAA", "FGTransposeMatrices", transpose);
+            }
+            int depthMode = fg::depthInvertedMode + 1;
+            const char* depthModes[] = { "Automatic", "Not inverted", "Inverted" };
+            if (ImGui::Combo("Depth", &depthMode, depthModes, 3)) {
+                fg::depthInvertedMode = depthMode - 1;
+                reshade::set_config_value(nullptr, "DLAA", "FGDepthInverted", depthMode - 1);
+            }
+            ImGui::Text("Camera: %s, depth %s", fg::lastCameraFromGame ? "projection from the game" : "projection estimated",
+                fg::lastDepthInverted ? "inverted" : "not inverted");
+            ImGui::TreePop();
+        }
+    }
+    else if (fg::bridgeRequested) {
+        ImGui::TextUnformatted("Frame Generation appears here once the DirectX 12 bridge is active.");
+    }
 
     ImGui::Separator();
     ImGui::TextUnformatted("Diagnostic (for development)");
@@ -800,6 +871,17 @@ void OnInitDevice(reshade::api::device* device) {
     reshade::get_config_value(nullptr, "DLAA", "AutoExposure", autoExposure);
     reshade::get_config_value(nullptr, "DLAA", "SuperResolution", superResolutionEnabled);
     reshade::get_config_value(nullptr, "DLAA", "FrameGenerationBridge", fg::bridgeRequested);
+    {
+        bool frameGeneration = false;
+        bool transpose = true;
+        int depthMode = -1;
+        reshade::get_config_value(nullptr, "DLAA", "FrameGeneration", frameGeneration);
+        reshade::get_config_value(nullptr, "DLAA", "FGTransposeMatrices", transpose);
+        reshade::get_config_value(nullptr, "DLAA", "FGDepthInverted", depthMode);
+        fg::frameGenerationEnabled = frameGeneration;
+        fg::transposeMatrices = transpose;
+        fg::depthInvertedMode = (depthMode >= -1 && depthMode <= 1) ? depthMode : -1;
+    }
     fg::InstallHook((ID3D11Device*)device->get_native());
     reshade::get_config_value(nullptr, "DLAA", "TextureDetail", mipBiasEnabled);
     reshade::get_config_value(nullptr, "DLAA", "TextureDetailAdjust", mipBiasEpsilon);
@@ -918,6 +1000,9 @@ void OnInitPipeline(device* device,
         if (shaderHash == kUpscaleShaderHash) {
             upscaleShaders.insert((ID3D11PixelShader*)pipeline.handle);
         }
+        if (shaderHash == kFinalOutputShaderHash) {
+            finalOutputShaders.insert((ID3D11PixelShader*)pipeline.handle);
+        }
     }
 }
 
@@ -936,6 +1021,119 @@ void OnDestroyPipeline(reshade::api::device* device, reshade::api::pipeline pipe
         sharpenShaders.erase((ID3D11PixelShader*)pipeline.handle);
     }
     upscaleShaders.erase((ID3D11PixelShader*)pipeline.handle);
+    finalOutputShaders.erase((ID3D11PixelShader*)pipeline.handle);
+}
+
+// Keeps a copy of the stretched image (before the HUD is drawn on it).
+static void CaptureHudlessSource(ID3D11DeviceContext* deviceContext, ID3D11Resource* target, const D3D11_TEXTURE2D_DESC& targetDesc) {
+    D3D11_TEXTURE2D_DESC currentDesc = {};
+    if (hudlessSourceTexture) {
+        hudlessSourceTexture->GetDesc(&currentDesc);
+    }
+    if (!hudlessSourceTexture || currentDesc.Width != targetDesc.Width || currentDesc.Height != targetDesc.Height || currentDesc.Format != targetDesc.Format) {
+        hudlessSourceSRV.reset();
+        hudlessSourceTexture.reset();
+        com_ptr<ID3D11Device> device;
+        deviceContext->GetDevice(&device);
+        D3D11_TEXTURE2D_DESC desc = {};
+        desc.Width = targetDesc.Width;
+        desc.Height = targetDesc.Height;
+        desc.MipLevels = 1;
+        desc.ArraySize = 1;
+        desc.Format = targetDesc.Format;
+        desc.SampleDesc.Count = 1;
+        desc.Usage = D3D11_USAGE_DEFAULT;
+        desc.BindFlags = D3D11_BIND_SHADER_RESOURCE;
+        if (FAILED(device->CreateTexture2D(&desc, nullptr, &hudlessSourceTexture)) ||
+            FAILED(device->CreateShaderResourceView(hudlessSourceTexture.get(), nullptr, &hudlessSourceSRV))) {
+            hudlessSourceSRV.reset();
+            hudlessSourceTexture.reset();
+            return;
+        }
+    }
+    deviceContext->CopySubresourceRegion(hudlessSourceTexture.get(), 0, 0, 0, 0, target, 0, nullptr);
+    hudlessSourceCaptured = true;
+}
+
+static bool GetBoundTexture2D(ID3D11View* view, com_ptr<ID3D11Resource>& resource, D3D11_TEXTURE2D_DESC& desc) {
+    if (!view) {
+        return false;
+    }
+    view->GetResource(&resource);
+    com_ptr<ID3D11Texture2D> texture;
+    if (!resource || FAILED(resource->QueryInterface(&texture)) || !texture) {
+        return false;
+    }
+    texture->GetDesc(&desc);
+    return true;
+}
+
+// Without Super Resolution: runs the game's 1:1 stretch draw here, then keeps a copy of it.
+template <typename DrawFn>
+static bool HandleStretchForHudless(ID3D11DeviceContext* deviceContext, DrawFn draw) {
+    if (hudlessSourceCaptured || !fg::frameInputs.valid) {
+        return false;
+    }
+    com_ptr<ID3D11ShaderResourceView> sourceSRV;
+    deviceContext->PSGetShaderResources(0, 1, &sourceSRV);
+    com_ptr<ID3D11RenderTargetView> targetRTV;
+    deviceContext->OMGetRenderTargets(1, &targetRTV, nullptr);
+    com_ptr<ID3D11Resource> source;
+    com_ptr<ID3D11Resource> target;
+    D3D11_TEXTURE2D_DESC sourceDesc;
+    D3D11_TEXTURE2D_DESC targetDesc;
+    if (!GetBoundTexture2D(sourceSRV.get(), source, sourceDesc) || !GetBoundTexture2D(targetRTV.get(), target, targetDesc)) {
+        return false;
+    }
+    if (sourceDesc.Width != taaConstantsCaptureWidth || sourceDesc.Height != taaConstantsCaptureHeight ||
+        targetDesc.Width != outputWidth || targetDesc.Height != outputHeight || targetDesc.SampleDesc.Count != 1) {
+        return false;
+    }
+    draw();
+    CaptureHudlessSource(deviceContext, target.get(), targetDesc);
+    return true;
+}
+
+// The game's last pass into the back buffer: run it once more on the copy without HUD.
+template <typename DrawFn>
+static void HandleFinalOutputForHudless(ID3D11DeviceContext* deviceContext, DrawFn draw) {
+    if (!hudlessSourceCaptured || !hudlessSourceSRV || !fg::frameInputs.valid) {
+        return;
+    }
+    ID3D11RenderTargetView* savedRTVs[D3D11_SIMULTANEOUS_RENDER_TARGET_COUNT] = {};
+    ID3D11DepthStencilView* savedDSV = nullptr;
+    deviceContext->OMGetRenderTargets(D3D11_SIMULTANEOUS_RENDER_TARGET_COUNT, savedRTVs, &savedDSV);
+    com_ptr<ID3D11Resource> target;
+    D3D11_TEXTURE2D_DESC targetDesc;
+    bool isBackBuffer = GetBoundTexture2D(savedRTVs[0], target, targetDesc) &&
+        target.get() == (ID3D11Resource*)fg::backBuffer11.load();
+
+    if (isBackBuffer && fg::EnsureHudless(targetDesc.Width, targetDesc.Height, targetDesc.Format)) {
+        ID3D11ShaderResourceView* savedSRV = nullptr;
+        deviceContext->PSGetShaderResources(0, 1, &savedSRV);
+
+        ID3D11RenderTargetView* hudlessRTV = fg::hudlessRTV11.get();
+        deviceContext->OMSetRenderTargets(1, &hudlessRTV, nullptr);
+        ID3D11ShaderResourceView* hudlessSRV = hudlessSourceSRV.get();
+        deviceContext->PSSetShaderResources(0, 1, &hudlessSRV);
+        draw();
+
+        deviceContext->OMSetRenderTargets(D3D11_SIMULTANEOUS_RENDER_TARGET_COUNT, savedRTVs, savedDSV);
+        deviceContext->PSSetShaderResources(0, 1, &savedSRV);
+        if (savedSRV) {
+            savedSRV->Release();
+        }
+        fg::frameInputs.hudlessValid = true;
+    }
+
+    for (auto* view : savedRTVs) {
+        if (view) {
+            view->Release();
+        }
+    }
+    if (savedDSV) {
+        savedDSV->Release();
+    }
 }
 
 // Replaces the game's final stretch (render resolution -> output resolution) with DLSS.
@@ -1001,6 +1199,9 @@ static bool HandleUpscalePass(ID3D11DeviceContext* deviceContext) {
     }
 
     deviceContext->CopySubresourceRegion(targetResource.get(), 0, 0, 0, 0, srOutputTexture.get(), 0, nullptr);
+    if (fg::FrameGenerationWanted() && fg::frameInputs.valid) {
+        CaptureHudlessSource(deviceContext, targetResource.get(), targetDesc);
+    }
 
     srEvaluatedThisFrame = true;
     SetStatus("DLSS Super Resolution", srRenderWidth, srRenderHeight, targetDesc.Width, targetDesc.Height);
@@ -1090,21 +1291,39 @@ bool OnDraw(reshade::api::command_list* cmd_list,
         com_ptr<ID3D11Resource> inDepth;
         inDepthSRV->GetResource(&inDepth);
 
+        // Frame Generation (DirectX 12 bridge): this frame's depth and motion vectors are shared too.
+        taaConstantsCaptureWidth = width;
+        taaConstantsCaptureHeight = height;
+        bool shareForFrameGeneration = fg::FrameGenerationWanted() && fg::EnsureFrameInputs(width, height);
+
         {
             ID3D11ShaderResourceView* srvs[] = { inVelocitySRV.get() , inDepthSRV.get() };
-            ID3D11UnorderedAccessView* uavs[] = { motionVectorUAV.get() };
+            ID3D11UnorderedAccessView* uavs[] = { motionVectorUAV.get(), shareForFrameGeneration ? fg::depthUAV11.get() : nullptr };
             ID3D11Buffer* cbs[] = { cbTemporalAA.get() };
             deviceContext->CSSetShader(prepareMotionVectorShader.get(), 0, 0);
             deviceContext->CSSetShaderResources(0, 2, srvs);
             deviceContext->CSSetConstantBuffers(0, 1, cbs);
-            deviceContext->CSSetUnorderedAccessViews(0, 1, uavs, nullptr);
+            deviceContext->CSSetUnorderedAccessViews(0, 2, uavs, nullptr);
             deviceContext->Dispatch((width + 7) / 8, (height + 7) / 8, 1);
 
             srvs[0] = nullptr;
             srvs[1] = nullptr;
             deviceContext->CSSetShaderResources(0, 2, srvs);
             uavs[0] = nullptr;
-            deviceContext->CSSetUnorderedAccessViews(0, 1, uavs, nullptr);
+            uavs[1] = nullptr;
+            deviceContext->CSSetUnorderedAccessViews(0, 2, uavs, nullptr);
+        }
+
+        if (shareForFrameGeneration) {
+            deviceContext->CopyResource(fg::motionShared.texture11.get(), motionVectorTexture.get());
+            bool cameraOk = taaConstantsSerial != taaConstantsUsedSerial &&
+                fg::ComputeCamera(taaConstants, width, height, fg::frameInputs);
+            taaConstantsUsedSerial = taaConstantsSerial;
+            fg::frameInputs.valid = cameraOk;
+            if (!cameraOk) {
+                fg::frameGenerationStatus = "waiting: the game's camera data was not found this frame";
+            }
+            DiagOnCamera(cameraOk);
         }
 
         // Super Resolution: the game renders below the output size, so DLSS runs later,
@@ -1190,6 +1409,13 @@ bool OnDraw(reshade::api::command_list* cmd_list,
     else if (srPending && upscaleShaders.find(shader.get()) != upscaleShaders.end()) {
         return HandleUpscalePass(deviceContext);
     }
+    else if (fg::FrameGenerationWanted() && upscaleShaders.find(shader.get()) != upscaleShaders.end()) {
+        return HandleStretchForHudless(deviceContext, [&]() { deviceContext->Draw(vertex_count, first_vertex); });
+    }
+    else if (fg::FrameGenerationWanted() && finalOutputShaders.find(shader.get()) != finalOutputShaders.end()) {
+        HandleFinalOutputForHudless(deviceContext, [&]() { deviceContext->Draw(vertex_count, first_vertex); });
+        return false;
+    }
     else if (sharpenShaders.find(shader.get()) != sharpenShaders.end()) {
         {
             D3D11_MAPPED_SUBRESOURCE mappedResource;
@@ -1231,22 +1457,21 @@ void OnUnmapBufferRegion(
         return;
     }
     if (mappedConstantBuffer) {
-        jitter[0] = ((float*)mappedConstantBuffer)[8];
-        jitter[1] = ((float*)mappedConstantBuffer)[9];
+        const float* data = (const float*)mappedConstantBuffer;
+        jitter[0] = data[8];
+        jitter[1] = data[9];
+        if (taaConstantsCaptureWidth != 0 &&
+            data[0] == (float)taaConstantsCaptureWidth && data[1] == (float)taaConstantsCaptureHeight) {
+            memcpy(taaConstants, data, sizeof(taaConstants));
+            taaConstantsSerial++;
+        }
         mappedConstantBuffer = nullptr;
     }
 }
 
-void OnPresent(command_queue* queue,
-    swapchain* swapchain,
-    const rect* source_rect,
-    const rect* dest_rect,
-    uint32_t dirty_rect_count,
-    const rect* dirty_rects) {
-    // Only once per frame rendered by the game (later, Frame Generation adds extra presents).
-    if (swapchain->get_device()->get_api() == device_api::d3d12 && !fg::inGameFramePresent) {
-        return;
-    }
+// End of a frame rendered by the game. Called from ReShade's present event (normal DirectX 11
+// path) or directly by the DirectX 12 bridge (which presents generated frames too).
+static void OnGameFrameEnd(uint64_t backBufferHandle, uint32_t backBufferWidth, uint32_t backBufferHeight) {
     needReset = !invokedThisFrame;
     invokedThisFrame = false;
 
@@ -1280,14 +1505,34 @@ void OnPresent(command_queue* queue,
     }
 
     // Output size = back buffer size.
+    if (backBufferWidth > 0 && backBufferHeight > 0) {
+        outputWidth = backBufferWidth;
+        outputHeight = backBufferHeight;
+    }
+    hudlessSourceCaptured = false;
+
+    DiagOnPresent(backBufferHandle);
+}
+
+void OnPresent(command_queue* queue,
+    swapchain* swapchain,
+    const rect* source_rect,
+    const rect* dest_rect,
+    uint32_t dirty_rect_count,
+    const rect* dirty_rects) {
+    // The DirectX 12 bridge calls OnGameFrameEnd itself, once per frame rendered by the game.
+    if (swapchain->get_device()->get_api() != device_api::d3d11) {
+        return;
+    }
     resource backBuffer = swapchain->get_current_back_buffer();
+    uint32_t width = 0;
+    uint32_t height = 0;
     if (backBuffer.handle != 0) {
         resource_desc backBufferDesc = swapchain->get_device()->get_resource_desc(backBuffer);
-        outputWidth = backBufferDesc.texture.width;
-        outputHeight = backBufferDesc.texture.height;
+        width = backBufferDesc.texture.width;
+        height = backBufferDesc.texture.height;
     }
-
-    DiagOnPresent(swapchain);
+    OnGameFrameEnd(backBuffer.handle, width, height);
 }
 
 bool OnDrawIndexed(reshade::api::command_list* cmd_list,
@@ -1301,11 +1546,15 @@ bool OnDrawIndexed(reshade::api::command_list* cmd_list,
     }
     ID3D11DeviceContext* deviceContext = (ID3D11DeviceContext*)(cmd_list->get_native());
     DiagOnGpuWork(deviceContext, false);
-    if (srPending) {
+    if (srPending || fg::FrameGenerationWanted()) {
         com_ptr<ID3D11PixelShader> shader;
         deviceContext->PSGetShader(&shader, nullptr, nullptr);
+        auto draw = [&]() { deviceContext->DrawIndexed(index_count, first_index, vertex_offset); };
         if (upscaleShaders.find(shader.get()) != upscaleShaders.end()) {
-            return HandleUpscalePass(deviceContext);
+            return srPending ? HandleUpscalePass(deviceContext) : HandleStretchForHudless(deviceContext, draw);
+        }
+        if (finalOutputShaders.find(shader.get()) != finalOutputShaders.end()) {
+            HandleFinalOutputForHudless(deviceContext, draw);
         }
     }
     return false;
@@ -1331,6 +1580,7 @@ BOOL APIENTRY DllMain(HMODULE hModule, DWORD fdwReason, LPVOID)
 	{
 	case DLL_PROCESS_ATTACH:
         addonModule = hModule;
+        fg::onGameFrameEnd = OnGameFrameEnd;
 		if (!reshade::register_addon(hModule))
 			return FALSE;
         reshade::register_overlay(nullptr, drawSettings);
