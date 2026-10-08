@@ -63,9 +63,20 @@ jobs:
             /p:Platform=x64 `
             /p:PlatformToolset=$env:PLATFORM_TOOLSET
 
-      - name: Disponibilizar o DLAA-Inject.addon64 para download
+      # Junta o add-on e as DLLs da NVIDIA (versão do SDK usado na compilação):
+      # nvngx_dlss.dll  = DLSS Super Resolution / DLAA
+      # nvngx_dlssg.dll = DLSS Frame Generation
+      - name: Juntar os arquivos para download
+        shell: pwsh
+        run: |
+          New-Item -ItemType Directory -Force -Path package | Out-Null
+          Copy-Item bin/Release/DLAA-Inject.addon64 package/
+          Copy-Item DLSS/lib/Windows_x86_64/rel/nvngx_dlss.dll package/
+          Copy-Item DLSS/lib/Windows_x86_64/rel/nvngx_dlssg.dll package/
+
+      - name: Disponibilizar os arquivos para download
         uses: actions/upload-artifact@v4
         with:
           name: DLAA-Inject
-          path: bin/Release/DLAA-Inject.addon64
+          path: package/
           if-no-files-found: error
