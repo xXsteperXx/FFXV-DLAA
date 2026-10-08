@@ -8,6 +8,10 @@
 #include <nvsdk_ngx_params.h>
 #include <nvsdk_ngx_helpers.h>
 #include <set>
+#include <mutex>
+#include <atomic>
+#include <unordered_map>
+#include <cstdio>
 
 #include "intermediate/PrepareMotionVectors.h"
 #include "intermediate/0x0D1CD1AA.h"
@@ -39,6 +43,171 @@ bool needReinitialize = false;
 NVSDK_NGX_DLSS_Hint_Render_Preset preset = NVSDK_NGX_DLSS_Hint_Render_Preset_K;
 bool autoExposure = false;
 float sharpenMultiplier = 1.0f;
+
+// ---------------------------------------------------------------------------
+// Diagnostic frame recorder.
+// Records one frame of the game's render passes into ReShade.log so we can
+// map the pipeline (render resolution, where the upscale happens, where the
+// HUD is drawn). Needed before adding DLSS Super Resolution and Frame Generation.
+// ---------------------------------------------------------------------------
+struct DiagPass {
+    ID3D11RenderTargetView* rtv = nullptr; // identity only, never dereferenced
+    char line[640] = {};
+    uint32_t draws = 0;
+    bool open = false;
+};
+
+std::mutex diagMutex;
+std::unordered_map<uint64_t, uint32_t> pixelShaderHashes; // guarded by diagMutex
+std::unordered_map<ID3D11DeviceContext*, DiagPass> diagPasses; // guarded by diagMutex
+std::atomic<bool> diagRequested = false;
+std::atomic<bool> diagCapturing = false;
+uint32_t diagPassIndex = 0;
+uint64_t diagBackBuffer = 0;
+
+static void DiagLog(const char* text) {
+    reshade::log::message(reshade::log::level::info, text);
+}
+
+static void DiagDescribeTexture(ID3D11Resource* resource, char* out, size_t outSize) {
+    if (!resource) {
+        snprintf(out, outSize, "-");
+        return;
+    }
+    com_ptr<ID3D11Texture2D> texture;
+    if (FAILED(resource->QueryInterface(&texture)) || !texture) {
+        snprintf(out, outSize, "(not 2D)");
+        return;
+    }
+    D3D11_TEXTURE2D_DESC desc;
+    texture->GetDesc(&desc);
+    snprintf(out, outSize, "%ux%u fmt=%u", desc.Width, desc.Height, (unsigned)desc.Format);
+}
+
+static void DiagDescribeView(ID3D11View* view, char* out, size_t outSize) {
+    com_ptr<ID3D11Resource> resource;
+    if (view) {
+        view->GetResource(&resource);
+    }
+    DiagDescribeTexture(resource.get(), out, outSize);
+}
+
+static void DiagFlushPass(DiagPass& pass) {
+    if (pass.open) {
+        char buffer[700];
+        snprintf(buffer, sizeof(buffer), "%s draws=%u", pass.line, pass.draws);
+        DiagLog(buffer);
+        pass.open = false;
+    }
+}
+
+static void DiagOnGpuWork(ID3D11DeviceContext* ctx, bool isDispatch) {
+    if (!diagCapturing) {
+        return;
+    }
+    std::lock_guard<std::mutex> lock(diagMutex);
+    if (!diagCapturing) {
+        return;
+    }
+
+    const char* contextTag = ctx->GetType() == D3D11_DEVICE_CONTEXT_DEFERRED ? " [deferred]" : "";
+    DiagPass& pass = diagPasses[ctx];
+
+    if (isDispatch) {
+        DiagFlushPass(pass);
+        pass.rtv = nullptr;
+        com_ptr<ID3D11UnorderedAccessView> uav;
+        ctx->CSGetUnorderedAccessViews(0, 1, &uav);
+        char uavText[64];
+        DiagDescribeView(uav.get(), uavText, sizeof(uavText));
+        char buffer[200];
+        snprintf(buffer, sizeof(buffer), "[DLAA-DIAG] #%03u COMPUTE uav0=%s%s", diagPassIndex++, uavText, contextTag);
+        DiagLog(buffer);
+        return;
+    }
+
+    com_ptr<ID3D11RenderTargetView> rtv;
+    com_ptr<ID3D11DepthStencilView> dsv;
+    ctx->OMGetRenderTargets(1, &rtv, &dsv);
+
+    if (pass.open && rtv.get() == pass.rtv) {
+        pass.draws++;
+        return;
+    }
+    DiagFlushPass(pass);
+
+    com_ptr<ID3D11PixelShader> ps;
+    ctx->PSGetShader(&ps, nullptr, nullptr);
+    char psText[32];
+    auto hashIt = pixelShaderHashes.find((uint64_t)ps.get());
+    if (!ps) {
+        snprintf(psText, sizeof(psText), "none");
+    }
+    else if (hashIt != pixelShaderHashes.end()) {
+        snprintf(psText, sizeof(psText), "0x%08X", hashIt->second);
+    }
+    else {
+        snprintf(psText, sizeof(psText), "?");
+    }
+    const char* tag = "";
+    if (taaShaders.count(ps.get())) {
+        tag = " <<TAA>>";
+    }
+    else if (sharpenShaders.count(ps.get())) {
+        tag = " <<SHARPEN>>";
+    }
+
+    com_ptr<ID3D11Resource> rtResource;
+    if (rtv) {
+        rtv->GetResource(&rtResource);
+    }
+    char rtText[64];
+    DiagDescribeTexture(rtResource.get(), rtText, sizeof(rtText));
+    const char* backBufferTag = (rtResource && (uint64_t)rtResource.get() == diagBackBuffer) ? " [BACKBUFFER]" : "";
+
+    com_ptr<ID3D11ShaderResourceView> srv0;
+    ctx->PSGetShaderResources(0, 1, &srv0);
+    char srvText[64];
+    DiagDescribeView(srv0.get(), srvText, sizeof(srvText));
+
+    UINT viewportCount = 1;
+    D3D11_VIEWPORT viewport = {};
+    ctx->RSGetViewports(&viewportCount, &viewport);
+
+    snprintf(pass.line, sizeof(pass.line),
+        "[DLAA-DIAG] #%03u DRAW rt0=%s%s viewport=%.0fx%.0f+%.0f,%.0f depth=%s ps=%s srv0=%s%s%s",
+        diagPassIndex++, rtText, backBufferTag,
+        viewport.Width, viewport.Height, viewport.TopLeftX, viewport.TopLeftY,
+        dsv ? "yes" : "no", psText, srvText, tag, contextTag);
+    pass.rtv = rtv.get();
+    pass.draws = 1;
+    pass.open = true;
+}
+
+static void DiagOnPresent(swapchain* swapchain) {
+    std::lock_guard<std::mutex> lock(diagMutex);
+    if (diagCapturing) {
+        for (auto& entry : diagPasses) {
+            DiagFlushPass(entry.second);
+        }
+        DiagLog("[DLAA-DIAG] ===== END OF FRAME =====");
+        diagCapturing = false;
+        diagPasses.clear();
+    }
+    if (diagRequested) {
+        diagRequested = false;
+        diagPassIndex = 0;
+        diagPasses.clear();
+        diagBackBuffer = swapchain->get_current_back_buffer().handle;
+        char backBufferText[64];
+        DiagDescribeTexture((ID3D11Resource*)diagBackBuffer, backBufferText, sizeof(backBufferText));
+        char buffer[200];
+        snprintf(buffer, sizeof(buffer), "[DLAA-DIAG] ===== START OF FRAME ===== backbuffer=%s jitter=%f,%f",
+            backBufferText, jitter[0], jitter[1]);
+        DiagLog(buffer);
+        diagCapturing = true;
+    }
+}
 
 void ReleaseDLSS() {
     if (parameters) {
@@ -126,6 +295,16 @@ static void drawSettings(reshade::api::effect_runtime*)
     {
         reshade::set_config_value(nullptr, "DLAA", "AutoExposure", autoExposure);
         needReinitialize = true;
+    }
+
+    ImGui::Separator();
+    ImGui::TextUnformatted("Diagnostic (for development)");
+    if (ImGui::Button("Record 1 frame to ReShade.log")) {
+        diagRequested = true;
+    }
+    if (diagRequested || diagCapturing) {
+        ImGui::SameLine();
+        ImGui::TextUnformatted("recording...");
     }
 }
 
@@ -232,6 +411,10 @@ void OnInitPipeline(device* device,
             continue;
         }
 
+        {
+            std::lock_guard<std::mutex> lock(diagMutex);
+            pixelShaderHashes[pipeline.handle] = shaderHash;
+        }
         if (shaderHash == 0x0DF0A97D) {
             taaShaders.insert((ID3D11PixelShader*)pipeline.handle);
         }
@@ -242,6 +425,10 @@ void OnInitPipeline(device* device,
 }
 
 void OnDestroyPipeline(reshade::api::device* device, reshade::api::pipeline pipeline) {
+    {
+        std::lock_guard<std::mutex> lock(diagMutex);
+        pixelShaderHashes.erase(pipeline.handle);
+    }
     if (taaShaders.find((ID3D11PixelShader*)pipeline.handle) != taaShaders.end()) {
         taaShaders.erase((ID3D11PixelShader*)pipeline.handle);
     }
@@ -256,6 +443,7 @@ bool OnDraw(reshade::api::command_list* cmd_list,
     uint32_t first_vertex,
     uint32_t first_instance) {
     ID3D11DeviceContext* deviceContext = (ID3D11DeviceContext*)(cmd_list->get_native());
+    DiagOnGpuWork(deviceContext, false);
     com_ptr<ID3D11PixelShader> shader;
     deviceContext->PSGetShader(&shader, nullptr, nullptr);
 
@@ -451,6 +639,25 @@ void OnPresent(command_queue* queue,
     const rect* dirty_rects) {
     needReset = !invokedThisFrame;
     invokedThisFrame = false;
+    DiagOnPresent(swapchain);
+}
+
+bool OnDrawIndexed(reshade::api::command_list* cmd_list,
+    uint32_t index_count,
+    uint32_t instance_count,
+    uint32_t first_index,
+    int32_t vertex_offset,
+    uint32_t first_instance) {
+    DiagOnGpuWork((ID3D11DeviceContext*)(cmd_list->get_native()), false);
+    return false;
+}
+
+bool OnDispatch(reshade::api::command_list* cmd_list,
+    uint32_t group_count_x,
+    uint32_t group_count_y,
+    uint32_t group_count_z) {
+    DiagOnGpuWork((ID3D11DeviceContext*)(cmd_list->get_native()), true);
+    return false;
 }
 
 extern "C" __declspec(dllexport) const char *NAME = "FFXV DLAA";
@@ -473,6 +680,8 @@ BOOL APIENTRY DllMain(HMODULE hModule, DWORD fdwReason, LPVOID)
         reshade::register_event<reshade::addon_event::map_buffer_region>(OnMapBufferRegion);
         reshade::register_event<reshade::addon_event::unmap_buffer_region>(OnUnmapBufferRegion);
         reshade::register_event<reshade::addon_event::present>(OnPresent);
+        reshade::register_event<reshade::addon_event::draw_indexed>(OnDrawIndexed);
+        reshade::register_event<reshade::addon_event::dispatch>(OnDispatch);
 		break;
 	case DLL_PROCESS_DETACH:
 		reshade::unregister_addon(hModule);
