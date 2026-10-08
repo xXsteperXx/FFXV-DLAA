@@ -341,7 +341,7 @@ static void DiagOnCamera(bool cameraOk) {
     const fg::FrameInputs& in = fg::frameInputs;
     snprintf(buffer, sizeof(buffer),
         "[DLAA-DIAG]      Frame Generation camera: %s, projection %s, near=%.4g far=%.6g fov=%.3f rad aspect=%.3f depth %s",
-        cameraOk ? "ok" : "NOT FOUND", fg::lastCameraFromGame ? "from the game" : "estimated",
+        cameraOk ? "ok" : "NOT FOUND", fg::lastCameraFromGame ? "from the game" : (fg::depthRangeFromGame ? "depth range from the game, field of view estimated" : "estimated"),
         in.nearPlane, in.farPlane, in.fov, in.aspect, in.depthInverted ? "inverted" : "not inverted");
     DiagLog(buffer);
 }
@@ -821,6 +821,35 @@ static void drawSettings(reshade::api::effect_runtime*)
         if (fg::multiFrameCountMax.load() > 0) {
             ImGui::Text("Driver limit: up to %u generated frame(s) per real frame", fg::multiFrameCountMax.load());
         }
+
+        // Latency
+        bool reflexOn = fg::reflexEnabled;
+        if (ImGui::Checkbox("NVIDIA Reflex (low latency)", &reflexOn)) {
+            fg::reflexEnabled = reflexOn;
+            reshade::set_config_value(nullptr, "DLAA", "Reflex", reflexOn);
+        }
+        if (reflexOn) {
+            ImGui::SameLine();
+            bool boost = fg::reflexBoost;
+            if (ImGui::Checkbox("+ Boost", &boost)) {
+                fg::reflexBoost = boost;
+                reshade::set_config_value(nullptr, "DLAA", "ReflexBoost", boost);
+            }
+        }
+        ImGui::Text("Reflex: %s", reflex::status.load());
+        int framesAhead = fg::framesAhead;
+        const char* framesAheadNames[] = { "0 (lowest lag, lower FPS)", "1 (recommended)", "2 (highest FPS, more lag)" };
+        if (ImGui::Combo("Frames prepared ahead", &framesAhead, framesAheadNames, 3)) {
+            fg::framesAhead = framesAhead;
+            reshade::set_config_value(nullptr, "DLAA", "FramesAhead", framesAhead);
+        }
+
+        // Statistics, to find the cause of stutters
+        ImGui::Text("Frames: %llu with a generated frame, %llu without (camera reused %llu times)",
+            (unsigned long long)fg::statGenerated.load(), (unsigned long long)fg::statNotGenerated.load(),
+            (unsigned long long)fg::statCameraReused.load());
+        ImGui::Text("Last frame without generation: %s", fg::statLastSkipReason.load());
+        ImGui::Text("Longest wait in Present (last 2 s): %.1f ms", fg::statLongestFrameMs.load());
         if (ImGui::TreeNode("Frame Generation debug options")) {
             bool transpose = fg::transposeMatrices;
             if (ImGui::Checkbox("Transposed camera matrices (default: on)", &transpose)) {
@@ -833,7 +862,7 @@ static void drawSettings(reshade::api::effect_runtime*)
                 fg::depthInvertedMode = depthMode - 1;
                 reshade::set_config_value(nullptr, "DLAA", "FGDepthInverted", depthMode - 1);
             }
-            ImGui::Text("Camera: %s, depth %s", fg::lastCameraFromGame ? "projection from the game" : "projection estimated",
+            ImGui::Text("Camera: %s, depth %s", fg::lastCameraFromGame ? "projection from the game" : (fg::depthRangeFromGame ? "depth range from the game" : "projection estimated"),
                 fg::lastDepthInverted ? "inverted" : "not inverted");
             ImGui::TreePop();
         }
@@ -881,6 +910,15 @@ void OnInitDevice(reshade::api::device* device) {
         reshade::get_config_value(nullptr, "DLAA", "FrameGeneration", frameGeneration);
         reshade::get_config_value(nullptr, "DLAA", "FGTransposeMatrices", transpose);
         reshade::get_config_value(nullptr, "DLAA", "FGDepthInverted", depthMode);
+        bool reflexOn = true;
+        bool reflexBoost = false;
+        int framesAhead = 1;
+        reshade::get_config_value(nullptr, "DLAA", "Reflex", reflexOn);
+        reshade::get_config_value(nullptr, "DLAA", "ReflexBoost", reflexBoost);
+        reshade::get_config_value(nullptr, "DLAA", "FramesAhead", framesAhead);
+        fg::reflexEnabled = reflexOn;
+        fg::reflexBoost = reflexBoost;
+        fg::framesAhead = (framesAhead >= 0 && framesAhead <= 2) ? framesAhead : 1;
         fg::frameGenerationEnabled = frameGeneration;
         fg::transposeMatrices = transpose;
         fg::depthInvertedMode = (depthMode >= -1 && depthMode <= 1) ? depthMode : -1;
@@ -1326,9 +1364,19 @@ bool OnDraw(reshade::api::command_list* cmd_list,
 
         if (shareForFrameGeneration) {
             deviceContext->CopyResource(fg::motionShared.texture11.get(), motionVectorTexture.get());
-            bool cameraOk = taaConstantsSerial != taaConstantsUsedSerial &&
+            // If the camera data is missing for a frame, the previous camera is reused (for a
+            // short while) instead of interrupting Frame Generation.
+            static uint32_t framesSinceCamera = 100000;
+            bool captured = taaConstantsSerial != taaConstantsUsedSerial &&
                 fg::ComputeCamera(taaConstants, width, height, fg::frameInputs);
             taaConstantsUsedSerial = taaConstantsSerial;
+            framesSinceCamera = captured ? 0 : framesSinceCamera + 1;
+            bool cameraOk = captured || framesSinceCamera <= 30;
+            if (!captured && cameraOk) {
+                fg::statCameraReused++;
+                fg::frameInputs.renderWidth = width;
+                fg::frameInputs.renderHeight = height;
+            }
             fg::frameInputs.valid = cameraOk;
             fg::frameGenerationProblem = cameraOk ? "" : "the game's camera data was not found (record a frame and send the diagnostic log)";
             DiagOnCamera(cameraOk);
