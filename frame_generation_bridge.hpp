@@ -1,43 +1,102 @@
 #pragma once
 // ---------------------------------------------------------------------------
-// DX11 -> DX12 presentation bridge (Frame Generation, step 1).
+// DX11 -> DX12 presentation bridge + DLSS Frame Generation.
 //
 // DLSS Frame Generation only runs on DirectX 12, but FFXV is a DirectX 11 game.
-// When enabled, this bridge intercepts the game's swap chain creation:
+// When the bridge is enabled, the game's swap chain creation is intercepted:
 //   - the real swap chain is created on a DirectX 12 queue (through ReShade,
 //     so ReShade still draws its menu and effects on it),
 //   - the game receives a stand-in swap chain whose back buffer is a texture
 //     shared between DirectX 11 and DirectX 12,
-//   - on every Present, the game's finished frame is copied into the DX12 back
-//     buffer and presented.
-// The game keeps rendering in DirectX 11 exactly as before. Frame Generation
-// (step 2) will run between the copy and the Present.
+//   - on every Present, the game's finished frame is handed to DirectX 12.
 //
-// Must be included after <reshade.hpp>, <com_ptr.hpp> and <d3d11.h>.
+// Without Frame Generation the frame is simply copied and presented.
+// With Frame Generation, the add-on (DirectX 11 side) also shares the depth,
+// the motion vectors, the image without HUD and the camera of each frame;
+// DLSS-FG then creates the in-between frame, and a separate thread presents the
+// generated frame followed by the real frame half a frame later (pacing).
+//
+// Synchronization uses two shared fences:
+//   fence11to12: signaled by DirectX 11 when a frame is finished, waited by DX12
+//   fence12:     signaled by DirectX 12 when it is done reading/copying,
+//                waited by DirectX 11 (before it overwrites shared textures) and the CPU
+//
+// Must be included after <reshade.hpp>, <com_ptr.hpp>, <d3d11.h> and the NGX headers.
 // ---------------------------------------------------------------------------
 #include <d3d11_4.h>
 #include <d3d12.h>
 #include <dxgi1_6.h>
+#include <nvsdk_ngx_helpers_dlssg.h>
 #include <atomic>
+#include <cmath>
+#include <condition_variable>
 #include <cstdarg>
+#include <cstring>
+#include <deque>
+#include <mutex>
+#include <thread>
 #include <vector>
 
 namespace fg {
 
-inline bool bridgeRequested = false;          // config [DLAA] FrameGenerationBridge, read at startup
+// ---------------------------------------------------------------------------
+// Settings and status (shown in the add-on menu)
+// ---------------------------------------------------------------------------
+inline bool bridgeRequested = false;           // config [DLAA] FrameGenerationBridge, read at startup
 inline std::atomic<bool> bridgeActive = false; // a bridged swap chain currently exists
 inline std::atomic<const char*> bridgeStatus = "off";
-inline bool inGameFramePresent = false;       // true while the bridge presents a frame the game rendered
 
+inline std::atomic<bool> frameGenerationEnabled = false; // config [DLAA] FrameGeneration
+inline std::atomic<const char*> frameGenerationStatus = "off";
+inline std::atomic<bool> frameGenerationRunning = false;
+inline std::atomic<bool> frameGenerationRetry = false;  // set by the menu when Frame Generation is switched on
+inline std::atomic<uint32_t> multiFrameCountMax = 0;    // reported by the driver (1 = only 2x)
+inline std::atomic<bool> transposeMatrices = true;      // debug: matrix layout handed to DLSS-FG
+inline std::atomic<int> depthInvertedMode = -1;         // debug: -1 automatic, 0 no, 1 yes
+inline std::atomic<bool> lastDepthInverted = false;
+inline std::atomic<bool> lastCameraFromGame = false;
+
+// Called on the game's render thread at the end of every frame the game rendered
+// (replaces ReShade's present event while the bridge is active).
+inline void (*onGameFrameEnd)(uint64_t backBuffer, uint32_t width, uint32_t height) = nullptr;
+inline std::atomic<ID3D11Texture2D*> backBuffer11 = nullptr; // identity of the game's back buffer
+
+// ---------------------------------------------------------------------------
+// Per-frame inputs for Frame Generation, filled by the add-on on the D3D11 side
+// (render thread) and consumed by Present on the same thread.
+// ---------------------------------------------------------------------------
+struct FrameInputs {
+    bool valid = false;        // depth, motion vectors and camera are from this frame
+    bool hudlessValid = false; // the image without HUD was captured this frame
+    uint32_t renderWidth = 0;
+    uint32_t renderHeight = 0;
+    float clipToPrevClip[4][4] = {};
+    float prevClipToClip[4][4] = {};
+    float viewToClip[4][4] = {};
+    float clipToView[4][4] = {};
+    float nearPlane = 0.1f;
+    float farPlane = 10000.0f;
+    float fov = 1.0f;
+    float aspect = 1.777f;
+    bool depthInverted = false;
+};
+inline FrameInputs frameInputs;
+
+// ---------------------------------------------------------------------------
+// Devices, queue, fences
+// ---------------------------------------------------------------------------
 inline com_ptr<ID3D11Device> device11;         // native D3D11 device of the game
 inline com_ptr<ID3D11Device5> device11_5;
 inline com_ptr<ID3D11DeviceContext4> context11;
 inline com_ptr<ID3D12Device> device12;         // created through ReShade (proxy)
 inline com_ptr<ID3D12CommandQueue> queue12;
-inline com_ptr<ID3D12Fence> fence12;           // shared with D3D11 (fence11 is the same fence)
-inline com_ptr<ID3D11Fence> fence11;
-inline HANDLE fenceEvent = nullptr;
-inline uint64_t fenceValue = 0;
+inline com_ptr<ID3D12Fence> fence11to12;
+inline com_ptr<ID3D11Fence> fence11to12_11;
+inline uint64_t value11to12 = 0;               // render thread only
+inline com_ptr<ID3D12Fence> fence12;
+inline com_ptr<ID3D11Fence> fence12_11;
+inline uint64_t value12 = 0;                   // guarded by queueMutex
+inline std::mutex queueMutex;                  // all DX12 queue submissions and presents
 inline bool tearingSupported = false;
 inline bool dx12InitTried = false;
 
@@ -55,32 +114,67 @@ inline void Log(reshade::log::level level, const char* format, ...) {
     reshade::log::message(level, buffer);
 }
 
-inline bool WaitForFence(uint64_t value, DWORD timeoutMs = 2000) {
+// CPU wait until DirectX 12 reached 'value' on fence12.
+inline bool WaitForFence12(uint64_t value, DWORD timeoutMs = 2000) {
     if (!fence12 || fence12->GetCompletedValue() >= value) {
         return true;
     }
-    if (FAILED(fence12->SetEventOnCompletion(value, fenceEvent))) {
+    thread_local HANDLE event = CreateEventW(nullptr, FALSE, FALSE, nullptr);
+    if (FAILED(fence12->SetEventOnCompletion(value, event))) {
         return false;
     }
-    if (WaitForSingleObject(fenceEvent, timeoutMs) != WAIT_OBJECT_0) {
+    if (WaitForSingleObject(event, timeoutMs) != WAIT_OBJECT_0) {
         Log(reshade::log::level::warning, "GPU wait timed out (fence %llu).", (unsigned long long)value);
         return false;
     }
     return true;
 }
 
-// Waits until both the D3D11 and the D3D12 side finished all submitted work.
+// Must be called with queueMutex held. Returns the value signaled.
+inline uint64_t SignalQueueLocked() {
+    uint64_t value = ++value12;
+    queue12->Signal(fence12.get(), value);
+    return value;
+}
+
+// DirectX 11 marks "everything submitted so far is finished"; returns the value.
+// Render thread only.
+inline uint64_t SignalFromD3D11() {
+    uint64_t value = ++value11to12;
+    context11->Signal(fence11to12_11.get(), value);
+    context11->Flush();
+    return value;
+}
+
+// Waits until both DirectX 11 and DirectX 12 finished all submitted work. Render thread only.
 inline void FlushGpu() {
-    if (!context11 || !queue12 || !fence11) {
+    if (!context11 || !queue12 || !fence11to12_11 || !fence12) {
         return;
     }
-    uint64_t d3d11Done = ++fenceValue;
-    context11->Signal(fence11.get(), d3d11Done);
-    context11->Flush();
-    queue12->Wait(fence12.get(), d3d11Done);
-    uint64_t allDone = ++fenceValue;
-    queue12->Signal(fence12.get(), allDone);
-    WaitForFence(allDone, 5000);
+    uint64_t d3d11Done = SignalFromD3D11();
+    uint64_t allDone;
+    {
+        std::lock_guard<std::mutex> lock(queueMutex);
+        queue12->Wait(fence11to12.get(), d3d11Done);
+        allDone = SignalQueueLocked();
+    }
+    WaitForFence12(allDone, 5000);
+}
+
+inline bool CreateSharedFence(com_ptr<ID3D12Fence>& fence, com_ptr<ID3D11Fence>& fence11) {
+    HANDLE sharedFence = nullptr;
+    if (FAILED(device12->CreateFence(0, D3D12_FENCE_FLAG_SHARED, __uuidof(ID3D12Fence), (void**)&fence)) ||
+        FAILED(device12->CreateSharedHandle(fence.get(), nullptr, GENERIC_ALL, nullptr, &sharedFence)) ||
+        FAILED(device11_5->OpenSharedFence(sharedFence, __uuidof(ID3D11Fence), (void**)&fence11)) || !fence11) {
+        if (sharedFence) {
+            CloseHandle(sharedFence);
+        }
+        fence11.reset();
+        fence.reset();
+        return false;
+    }
+    CloseHandle(sharedFence);
+    return true;
 }
 
 // Creates the D3D12 device/queue on the same GPU as the game's D3D11 device.
@@ -162,22 +256,16 @@ inline bool InitDX12() {
         return false;
     }
 
-    HANDLE sharedFence = nullptr;
-    if (FAILED(device12->CreateFence(0, D3D12_FENCE_FLAG_SHARED, __uuidof(ID3D12Fence), (void**)&fence12)) ||
-        FAILED(device12->CreateSharedHandle(fence12.get(), nullptr, GENERIC_ALL, nullptr, &sharedFence)) ||
-        FAILED(device11_5->OpenSharedFence(sharedFence, __uuidof(ID3D11Fence), (void**)&fence11)) || !fence11) {
-        if (sharedFence) {
-            CloseHandle(sharedFence);
-        }
-        fence11.reset();
+    if (!CreateSharedFence(fence11to12, fence11to12_11) || !CreateSharedFence(fence12, fence12_11)) {
+        fence11to12.reset();
+        fence11to12_11.reset();
         fence12.reset();
+        fence12_11.reset();
         queue12.reset();
         device12.reset();
-        bridgeStatus = "failed: could not share a fence between DX11 and DX12";
+        bridgeStatus = "failed: could not share fences between DX11 and DX12";
         return false;
     }
-    CloseHandle(sharedFence);
-    fenceEvent = CreateEventW(nullptr, FALSE, FALSE, nullptr);
 
     Log(reshade::log::level::info, "DirectX 12 device created (tearing %s).", tearingSupported ? "supported" : "not supported");
     return true;
@@ -198,6 +286,341 @@ inline DXGI_FORMAT FlipCompatibleFormat(DXGI_FORMAT format) {
     }
 }
 
+inline bool CreateTexture12(uint32_t width, uint32_t height, DXGI_FORMAT format, D3D12_RESOURCE_FLAGS flags,
+    D3D12_HEAP_FLAGS heapFlags, D3D12_RESOURCE_STATES state, com_ptr<ID3D12Resource>& out) {
+    D3D12_HEAP_PROPERTIES heap = {};
+    heap.Type = D3D12_HEAP_TYPE_DEFAULT;
+    D3D12_RESOURCE_DESC desc = {};
+    desc.Dimension = D3D12_RESOURCE_DIMENSION_TEXTURE2D;
+    desc.Width = width;
+    desc.Height = height;
+    desc.DepthOrArraySize = 1;
+    desc.MipLevels = 1;
+    desc.Format = format;
+    desc.SampleDesc.Count = 1;
+    desc.Layout = D3D12_TEXTURE_LAYOUT_UNKNOWN;
+    desc.Flags = flags;
+    return SUCCEEDED(device12->CreateCommittedResource(&heap, heapFlags, &desc, state, nullptr, __uuidof(ID3D12Resource), (void**)&out)) && out;
+}
+
+// A texture that DirectX 11 writes and DirectX 12 reads.
+struct SharedTexture {
+    com_ptr<ID3D12Resource> resource12;
+    com_ptr<ID3D11Texture2D> texture11;
+    uint32_t width = 0;
+    uint32_t height = 0;
+    DXGI_FORMAT format = DXGI_FORMAT_UNKNOWN;
+
+    void Reset() {
+        resource12.reset();
+        texture11.reset();
+        width = 0;
+        height = 0;
+        format = DXGI_FORMAT_UNKNOWN;
+    }
+    bool Matches(uint32_t w, uint32_t h, DXGI_FORMAT f) const {
+        return texture11 && resource12 && width == w && height == h && format == f;
+    }
+    bool Create(uint32_t w, uint32_t h, DXGI_FORMAT f, D3D12_RESOURCE_FLAGS flags) {
+        Reset();
+        if (!CreateTexture12(w, h, f, flags | D3D12_RESOURCE_FLAG_ALLOW_SIMULTANEOUS_ACCESS, D3D12_HEAP_FLAG_SHARED, D3D12_RESOURCE_STATE_COMMON, resource12)) {
+            return false;
+        }
+        HANDLE sharedHandle = nullptr;
+        if (FAILED(device12->CreateSharedHandle(resource12.get(), nullptr, GENERIC_ALL, nullptr, &sharedHandle))) {
+            Reset();
+            return false;
+        }
+        HRESULT hr = device11_5->OpenSharedResource1(sharedHandle, __uuidof(ID3D11Texture2D), (void**)&texture11);
+        CloseHandle(sharedHandle);
+        if (FAILED(hr) || !texture11) {
+            Reset();
+            return false;
+        }
+        width = w;
+        height = h;
+        format = f;
+        return true;
+    }
+};
+
+// Frame Generation inputs shared with DirectX 12 (created on demand by the add-on).
+inline SharedTexture depthShared;   // R32_FLOAT, render resolution, written by the motion vector shader
+inline SharedTexture motionShared;  // R16G16_FLOAT, render resolution, copied from the DLSS motion vectors
+inline SharedTexture hudlessShared; // back buffer format, output resolution
+inline com_ptr<ID3D11UnorderedAccessView> depthUAV11;
+inline com_ptr<ID3D11RenderTargetView> hudlessRTV11;
+
+// True when the add-on should prepare Frame Generation inputs this frame.
+inline bool FrameGenerationWanted() {
+    return bridgeActive && frameGenerationEnabled && device12;
+}
+
+// Depth and motion vector textures at the render resolution. Render thread only.
+inline bool EnsureFrameInputs(uint32_t renderWidth, uint32_t renderHeight) {
+    if (depthShared.Matches(renderWidth, renderHeight, DXGI_FORMAT_R32_FLOAT) &&
+        motionShared.Matches(renderWidth, renderHeight, DXGI_FORMAT_R16G16_FLOAT) && depthUAV11) {
+        return true;
+    }
+    FlushGpu(); // the previous textures may still be read by DirectX 12
+    depthUAV11.reset();
+    if (!depthShared.Create(renderWidth, renderHeight, DXGI_FORMAT_R32_FLOAT, D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS) ||
+        !motionShared.Create(renderWidth, renderHeight, DXGI_FORMAT_R16G16_FLOAT, D3D12_RESOURCE_FLAG_NONE)) {
+        depthShared.Reset();
+        motionShared.Reset();
+        frameGenerationStatus = "failed: could not share depth/motion vectors";
+        return false;
+    }
+    D3D11_UNORDERED_ACCESS_VIEW_DESC uavDesc = {};
+    uavDesc.Format = DXGI_FORMAT_R32_FLOAT;
+    uavDesc.ViewDimension = D3D11_UAV_DIMENSION_TEXTURE2D;
+    if (FAILED(device11->CreateUnorderedAccessView(depthShared.texture11.get(), &uavDesc, &depthUAV11))) {
+        depthShared.Reset();
+        motionShared.Reset();
+        return false;
+    }
+    return true;
+}
+
+// Image without HUD, in the back buffer format. Render thread only.
+inline bool EnsureHudless(uint32_t width, uint32_t height, DXGI_FORMAT format) {
+    if (hudlessShared.Matches(width, height, format) && hudlessRTV11) {
+        return true;
+    }
+    FlushGpu();
+    hudlessRTV11.reset();
+    if (!hudlessShared.Create(width, height, format, D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET)) {
+        return false;
+    }
+    if (FAILED(device11->CreateRenderTargetView(hudlessShared.texture11.get(), nullptr, &hudlessRTV11))) {
+        hudlessShared.Reset();
+        return false;
+    }
+    return true;
+}
+
+// ---------------------------------------------------------------------------
+// Camera data for DLSS-FG, from the game's TAA constants (cbTemporalAA).
+//   c3..c6:  g_motionMatrix      (uv, depth) of this frame -> (uv, depth) of the previous frame
+//   c7..c10: g_reconstructMatrix (uv, depth) -> camera view space (verified at runtime)
+// Both are stored column by column (HLSL default), used as M * v.
+// ---------------------------------------------------------------------------
+inline void Multiply(const float a[4][4], const float b[4][4], float out[4][4]) {
+    float r[4][4];
+    for (int i = 0; i < 4; ++i) {
+        for (int j = 0; j < 4; ++j) {
+            r[i][j] = a[i][0] * b[0][j] + a[i][1] * b[1][j] + a[i][2] * b[2][j] + a[i][3] * b[3][j];
+        }
+    }
+    memcpy(out, r, sizeof(r));
+}
+
+inline bool Invert(const float m[4][4], float out[4][4]) {
+    const float* a = &m[0][0];
+    float inv[16];
+    inv[0] = a[5] * a[10] * a[15] - a[5] * a[11] * a[14] - a[9] * a[6] * a[15] + a[9] * a[7] * a[14] + a[13] * a[6] * a[11] - a[13] * a[7] * a[10];
+    inv[4] = -a[4] * a[10] * a[15] + a[4] * a[11] * a[14] + a[8] * a[6] * a[15] - a[8] * a[7] * a[14] - a[12] * a[6] * a[11] + a[12] * a[7] * a[10];
+    inv[8] = a[4] * a[9] * a[15] - a[4] * a[11] * a[13] - a[8] * a[5] * a[15] + a[8] * a[7] * a[13] + a[12] * a[5] * a[11] - a[12] * a[7] * a[9];
+    inv[12] = -a[4] * a[9] * a[14] + a[4] * a[10] * a[13] + a[8] * a[5] * a[14] - a[8] * a[6] * a[13] - a[12] * a[5] * a[10] + a[12] * a[6] * a[9];
+    inv[1] = -a[1] * a[10] * a[15] + a[1] * a[11] * a[14] + a[9] * a[2] * a[15] - a[9] * a[3] * a[14] - a[13] * a[2] * a[11] + a[13] * a[3] * a[10];
+    inv[5] = a[0] * a[10] * a[15] - a[0] * a[11] * a[14] - a[8] * a[2] * a[15] + a[8] * a[3] * a[14] + a[12] * a[2] * a[11] - a[12] * a[3] * a[10];
+    inv[9] = -a[0] * a[9] * a[15] + a[0] * a[11] * a[13] + a[8] * a[1] * a[15] - a[8] * a[3] * a[13] - a[12] * a[1] * a[11] + a[12] * a[3] * a[9];
+    inv[13] = a[0] * a[9] * a[14] - a[0] * a[10] * a[13] - a[8] * a[1] * a[14] + a[8] * a[2] * a[13] + a[12] * a[1] * a[10] - a[12] * a[2] * a[9];
+    inv[2] = a[1] * a[6] * a[15] - a[1] * a[7] * a[14] - a[5] * a[2] * a[15] + a[5] * a[3] * a[14] + a[13] * a[2] * a[7] - a[13] * a[3] * a[6];
+    inv[6] = -a[0] * a[6] * a[15] + a[0] * a[7] * a[14] + a[4] * a[2] * a[15] - a[4] * a[3] * a[14] - a[12] * a[2] * a[7] + a[12] * a[3] * a[6];
+    inv[10] = a[0] * a[5] * a[15] - a[0] * a[7] * a[13] - a[4] * a[1] * a[15] + a[4] * a[3] * a[13] + a[12] * a[1] * a[7] - a[12] * a[3] * a[5];
+    inv[14] = -a[0] * a[5] * a[14] + a[0] * a[6] * a[13] + a[4] * a[1] * a[14] - a[4] * a[2] * a[13] - a[12] * a[1] * a[6] + a[12] * a[2] * a[5];
+    inv[3] = -a[1] * a[6] * a[11] + a[1] * a[7] * a[10] + a[5] * a[2] * a[11] - a[5] * a[3] * a[10] - a[9] * a[2] * a[7] + a[9] * a[3] * a[6];
+    inv[7] = a[0] * a[6] * a[11] - a[0] * a[7] * a[10] - a[4] * a[2] * a[11] + a[4] * a[3] * a[10] + a[8] * a[2] * a[7] - a[8] * a[3] * a[6];
+    inv[11] = -a[0] * a[5] * a[11] + a[0] * a[7] * a[9] + a[4] * a[1] * a[11] - a[4] * a[3] * a[9] - a[8] * a[1] * a[7] + a[8] * a[3] * a[5];
+    inv[15] = a[0] * a[5] * a[10] - a[0] * a[6] * a[9] - a[4] * a[1] * a[10] + a[4] * a[2] * a[9] + a[8] * a[1] * a[6] - a[8] * a[2] * a[5];
+    float det = a[0] * inv[0] + a[1] * inv[4] + a[2] * inv[8] + a[3] * inv[12];
+    if (!std::isfinite(det) || std::fabs(det) < 1e-20f) {
+        return false;
+    }
+    float invDet = 1.0f / det;
+    float* o = &out[0][0];
+    for (int i = 0; i < 16; ++i) {
+        o[i] = inv[i] * invDet;
+    }
+    return true;
+}
+
+inline void TransformPoint(const float m[4][4], float x, float y, float z, float out[3], float* w = nullptr) {
+    float r[4];
+    for (int i = 0; i < 4; ++i) {
+        r[i] = m[i][0] * x + m[i][1] * y + m[i][2] * z + m[i][3];
+    }
+    if (w) {
+        *w = r[3];
+    }
+    float invW = std::fabs(r[3]) > 1e-12f ? 1.0f / r[3] : 0.0f;
+    out[0] = r[0] * invW;
+    out[1] = r[1] * invW;
+    out[2] = r[2] * invW;
+}
+
+inline bool AllFinite(const float m[4][4]) {
+    for (int i = 0; i < 4; ++i) {
+        for (int j = 0; j < 4; ++j) {
+            if (!std::isfinite(m[i][j])) {
+                return false;
+            }
+        }
+    }
+    return true;
+}
+
+// Fills the camera part of 'inputs' from the 64 floats of the TAA constant buffer.
+// Returns false when the data does not look like a camera.
+inline bool ComputeCamera(const float* c, uint32_t renderWidth, uint32_t renderHeight, FrameInputs& inputs) {
+    float motion[4][4];
+    float reconstruct[4][4];
+    for (int row = 0; row < 4; ++row) {
+        for (int col = 0; col < 4; ++col) {
+            motion[row][col] = c[12 + 4 * col + row];
+            reconstruct[row][col] = c[28 + 4 * col + row];
+        }
+    }
+    // Clip (NDC) <-> (uv, depth): u = 0.5x + 0.5, v = -0.5y + 0.5
+    const float ndcToUv[4][4] = { { 0.5f, 0, 0, 0.5f }, { 0, -0.5f, 0, 0.5f }, { 0, 0, 1, 0 }, { 0, 0, 0, 1 } };
+    const float uvToNdc[4][4] = { { 2.0f, 0, 0, -1.0f }, { 0, -2.0f, 0, 1.0f }, { 0, 0, 1, 0 }, { 0, 0, 0, 1 } };
+
+    float temp[4][4];
+    Multiply(motion, ndcToUv, temp);
+    Multiply(uvToNdc, temp, inputs.clipToPrevClip);
+    if (!AllFinite(inputs.clipToPrevClip) || !Invert(inputs.clipToPrevClip, inputs.prevClipToClip)) {
+        return false;
+    }
+
+    // Projection: accept the reconstruct matrix only if the screen center maps onto the view axis.
+    bool projectionFromGame = false;
+    Multiply(reconstruct, ndcToUv, inputs.clipToView);
+    if (AllFinite(inputs.clipToView) && Invert(inputs.clipToView, inputs.viewToClip)) {
+        float atZero[3];
+        float atOne[3];
+        float wOne = 0.0f;
+        TransformPoint(inputs.clipToView, 0.0f, 0.0f, 0.0f, atZero);
+        TransformPoint(inputs.clipToView, 0.0f, 0.0f, 1.0f, atOne, &wOne);
+        float zZero = std::fabs(atZero[2]);
+        float zOne = std::fabs(wOne) > 1e-9f ? std::fabs(atOne[2]) : 1.0e6f;
+        bool onAxis = std::fabs(atZero[0]) <= 1e-3f * (zZero + 1e-3f) && std::fabs(atZero[1]) <= 1e-3f * (zZero + 1e-3f);
+        float p00 = inputs.viewToClip[0][0];
+        float p11 = inputs.viewToClip[1][1];
+        if (onAxis && zZero > 0.0f && std::isfinite(zOne) && std::fabs(p11) > 1e-6f && std::fabs(p00) > 1e-6f) {
+            inputs.depthInverted = zZero > zOne;
+            inputs.nearPlane = zZero < zOne ? zZero : zOne;
+            inputs.farPlane = zZero < zOne ? zOne : zZero;
+            if (inputs.farPlane > 1.0e6f) {
+                inputs.farPlane = 1.0e6f;
+            }
+            inputs.fov = 2.0f * std::atan(1.0f / std::fabs(p11));
+            inputs.aspect = std::fabs(p11 / p00);
+            projectionFromGame = true;
+        }
+    }
+    if (!projectionFromGame) {
+        // Plausible defaults so DLSS-FG still gets a consistent projection.
+        const float n = 0.1f;
+        const float f = 10000.0f;
+        const float fov = 1.0f; // about 57 degrees vertical
+        const float aspect = renderHeight ? (float)renderWidth / (float)renderHeight : 1.777f;
+        const float yScale = 1.0f / std::tan(fov * 0.5f);
+        float p[4][4] = { { yScale / aspect, 0, 0, 0 }, { 0, yScale, 0, 0 }, { 0, 0, f / (f - n), -n * f / (f - n) }, { 0, 0, 1, 0 } };
+        memcpy(inputs.viewToClip, p, sizeof(p));
+        Invert(inputs.viewToClip, inputs.clipToView);
+        inputs.nearPlane = n;
+        inputs.farPlane = f;
+        inputs.fov = fov;
+        inputs.aspect = aspect;
+        inputs.depthInverted = false;
+    }
+    int mode = depthInvertedMode;
+    if (mode == 0 || mode == 1) {
+        inputs.depthInverted = mode == 1;
+    }
+    lastDepthInverted = inputs.depthInverted;
+    lastCameraFromGame = projectionFromGame;
+    inputs.renderWidth = renderWidth;
+    inputs.renderHeight = renderHeight;
+    return true;
+}
+
+inline void CopyMatrixForDLSS(const float in[4][4], float out[4][4]) {
+    // DLSS-FG expects row-major matrices for row vectors (v * M), i.e. the transpose
+    // of the column-vector matrices computed above. Toggle kept for testing.
+    if (transposeMatrices) {
+        for (int i = 0; i < 4; ++i) {
+            for (int j = 0; j < 4; ++j) {
+                out[i][j] = in[j][i];
+            }
+        }
+    }
+    else {
+        memcpy(out, in, sizeof(float) * 16);
+    }
+}
+
+// ---------------------------------------------------------------------------
+// NGX (DLSS Frame Generation) on the DirectX 12 device
+// ---------------------------------------------------------------------------
+inline bool ngx12InitTried = false;
+inline bool ngx12Available = false;
+inline NVSDK_NGX_Parameter* fgParameters = nullptr;
+inline NVSDK_NGX_Handle* fgHandle = nullptr;
+inline uint32_t fgWidth = 0;
+inline uint32_t fgHeight = 0;
+inline uint32_t fgRenderWidth = 0;
+inline uint32_t fgRenderHeight = 0;
+inline DXGI_FORMAT fgFormat = DXGI_FORMAT_UNKNOWN;
+
+inline bool InitNGX12() {
+    if (ngx12InitTried) {
+        return ngx12Available;
+    }
+    ngx12InitTried = true;
+    if (NVSDK_NGX_FAILED(NVSDK_NGX_D3D12_Init(1, L"", device12.get()))) {
+        frameGenerationStatus = "unavailable: NGX could not start on DirectX 12";
+        return false;
+    }
+    NVSDK_NGX_Parameter* caps = nullptr;
+    if (NVSDK_NGX_FAILED(NVSDK_NGX_D3D12_GetCapabilityParameters(&caps)) || !caps) {
+        frameGenerationStatus = "unavailable: no NGX capabilities";
+        return false;
+    }
+    int available = 0;
+    int needsUpdatedDriver = 0;
+    unsigned int mfgMax = 0;
+    caps->Get(NVSDK_NGX_Parameter_FrameGeneration_Available, &available);
+    caps->Get(NVSDK_NGX_Parameter_FrameInterpolation_NeedsUpdatedDriver, &needsUpdatedDriver);
+    caps->Get(NVSDK_NGX_DLSSG_Parameter_MultiFrameCountMax, &mfgMax);
+    NVSDK_NGX_D3D12_DestroyParameters(caps);
+    multiFrameCountMax = mfgMax;
+    Log(reshade::log::level::info, "DLSS Frame Generation available=%d, needs newer driver=%d, MultiFrameCountMax=%u.", available, needsUpdatedDriver, mfgMax);
+    if (!available) {
+        frameGenerationStatus = needsUpdatedDriver ? "unavailable: update the NVIDIA driver"
+                                                   : "unavailable: check nvngx_dlssg.dll in the game folder, RTX 40+ GPU, Hardware-accelerated GPU scheduling";
+        return false;
+    }
+    if (NVSDK_NGX_FAILED(NVSDK_NGX_D3D12_AllocateParameters(&fgParameters)) || !fgParameters) {
+        frameGenerationStatus = "unavailable: NGX parameters";
+        return false;
+    }
+    ngx12Available = true;
+    return true;
+}
+
+// Render thread only, outside queueMutex.
+inline void ReleaseFrameGenerationFeature() {
+    if (fgHandle) {
+        FlushGpu();
+        NVSDK_NGX_D3D12_ReleaseFeature(fgHandle);
+        fgHandle = nullptr;
+    }
+    fgWidth = fgHeight = fgRenderWidth = fgRenderHeight = 0;
+    fgFormat = DXGI_FORMAT_UNKNOWN;
+}
+
 // ---------------------------------------------------------------------------
 // The swap chain the game sees.
 // ---------------------------------------------------------------------------
@@ -206,20 +629,18 @@ public:
     BridgeSwapChain(IDXGISwapChain3* real, IUnknown* gameDevice, const DXGI_SWAP_CHAIN_DESC& gameDesc, UINT realBufferCount, UINT realFlags)
         : _real(real), _gameDevice(gameDevice), _gameDesc(gameDesc), _realBufferCount(realBufferCount), _realFlags(realFlags) {
         _real->QueryInterface(&_real4);
+        QueryPerformanceFrequency(&_qpcFrequency);
     }
 
     bool Initialize() {
-        for (int i = 0; i < kFrames; ++i) {
-            if (FAILED(device12->CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_DIRECT, __uuidof(ID3D12CommandAllocator), (void**)&_allocators[i]))) {
-                return false;
-            }
-            _allocatorFence[i] = 0;
-        }
-        if (FAILED(device12->CreateCommandList(0, D3D12_COMMAND_LIST_TYPE_DIRECT, _allocators[0].get(), nullptr, __uuidof(ID3D12GraphicsCommandList), (void**)&_commandList))) {
+        if (!CreateCommandRing(_renderRing) || !CreateCommandRing(_presentRing)) {
             return false;
         }
-        _commandList->Close();
-        return CreateBuffers();
+        if (!CreateBuffers()) {
+            return false;
+        }
+        _presenter = std::thread([this]() { PresenterLoop(); });
+        return true;
     }
 
     // IUnknown
@@ -269,6 +690,8 @@ public:
         return _shared11->QueryInterface(riid, surface);
     }
     HRESULT STDMETHODCALLTYPE SetFullscreenState(BOOL fullscreen, IDXGIOutput* target) override {
+        DrainPresenter();
+        std::lock_guard<std::mutex> lock(queueMutex);
         return _real->SetFullscreenState(fullscreen, target);
     }
     HRESULT STDMETHODCALLTYPE GetFullscreenState(BOOL* fullscreen, IDXGIOutput** target) override {
@@ -345,20 +768,110 @@ public:
     }
 
 private:
-    static constexpr int kFrames = 3;
+    static constexpr int kRingSize = 3;
+    static constexpr int kSlots = 2;
+
+    // Command allocators + list used by one thread.
+    struct CommandRing {
+        com_ptr<ID3D12CommandAllocator> allocators[kRingSize];
+        uint64_t allocatorFence[kRingSize] = {};
+        com_ptr<ID3D12GraphicsCommandList> list;
+        uint64_t counter = 0;
+    };
+
+    // One frame handed to the presenter thread: generated frame + copy of the real frame.
+    struct Slot {
+        com_ptr<ID3D12Resource> generated; // UNORDERED_ACCESS state
+        com_ptr<ID3D12Resource> real;      // UNORDERED_ACCESS state
+        uint64_t freeFence = 0;            // GPU finished presenting this slot
+        bool queued = false;               // guarded by _slotMutex
+    };
+
+    struct Job {
+        int slot;
+        bool hasGenerated;
+        UINT syncInterval;
+        UINT flags;
+        double frameInterval; // seconds between frames rendered by the game
+    };
 
     ~BridgeSwapChain() {
+        {
+            std::lock_guard<std::mutex> lock(_jobMutex);
+            _quit = true;
+        }
+        _jobCv.notify_all();
+        if (_presenter.joinable()) {
+            _presenter.join();
+        }
         FlushGpu();
+        ReleaseSlots();
         ReleaseBuffers();
         bridgeActive = false;
+        frameGenerationRunning = false;
+        backBuffer11 = nullptr;
         bridgeStatus = "off (swap chain released)";
         Log(reshade::log::level::info, "Bridged swap chain released.");
+    }
+
+    bool CreateCommandRing(CommandRing& ring) {
+        for (int i = 0; i < kRingSize; ++i) {
+            if (FAILED(device12->CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_DIRECT, __uuidof(ID3D12CommandAllocator), (void**)&ring.allocators[i]))) {
+                return false;
+            }
+        }
+        if (FAILED(device12->CreateCommandList(0, D3D12_COMMAND_LIST_TYPE_DIRECT, ring.allocators[0].get(), nullptr, __uuidof(ID3D12GraphicsCommandList), (void**)&ring.list))) {
+            return false;
+        }
+        ring.list->Close();
+        return true;
+    }
+
+    // Opens the next command list of a ring. Returns the slot index used.
+    int BeginCommands(CommandRing& ring) {
+        int index = (int)(ring.counter++ % kRingSize);
+        WaitForFence12(ring.allocatorFence[index]);
+        ring.allocators[index]->Reset();
+        ring.list->Reset(ring.allocators[index].get(), nullptr);
+        return index;
+    }
+
+    static void Transition(ID3D12GraphicsCommandList* list, ID3D12Resource* resource, D3D12_RESOURCE_STATES before, D3D12_RESOURCE_STATES after) {
+        D3D12_RESOURCE_BARRIER barrier = {};
+        barrier.Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
+        barrier.Transition.pResource = resource;
+        barrier.Transition.Subresource = D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES;
+        barrier.Transition.StateBefore = before;
+        barrier.Transition.StateAfter = after;
+        list->ResourceBarrier(1, &barrier);
+    }
+
+    UINT PresentFlags(UINT syncInterval, UINT flags) {
+        UINT presentFlags = flags & (DXGI_PRESENT_DO_NOT_WAIT | DXGI_PRESENT_RESTART);
+        if (syncInterval == 0 && tearingSupported) {
+            BOOL fullscreen = FALSE;
+            _real->GetFullscreenState(&fullscreen, nullptr);
+            if (!fullscreen) {
+                presentFlags |= DXGI_PRESENT_ALLOW_TEARING;
+            }
+        }
+        return presentFlags;
     }
 
     void ReleaseBuffers() {
         _backBuffers12.clear();
         _shared11.reset();
         _shared12.reset();
+        backBuffer11 = nullptr;
+    }
+
+    void ReleaseSlots() {
+        for (Slot& slot : _slots) {
+            slot.generated.reset();
+            slot.real.reset();
+            slot.freeFence = 0;
+            slot.queued = false;
+        }
     }
 
     bool CreateBuffers() {
@@ -369,21 +882,10 @@ private:
         UINT width = realDesc.BufferDesc.Width;
         UINT height = realDesc.BufferDesc.Height;
 
-        D3D12_HEAP_PROPERTIES heap = {};
-        heap.Type = D3D12_HEAP_TYPE_DEFAULT;
-        D3D12_RESOURCE_DESC desc = {};
-        desc.Dimension = D3D12_RESOURCE_DIMENSION_TEXTURE2D;
-        desc.Width = width;
-        desc.Height = height;
-        desc.DepthOrArraySize = 1;
-        desc.MipLevels = 1;
-        desc.Format = _gameDesc.BufferDesc.Format;
-        desc.SampleDesc.Count = 1;
-        desc.Layout = D3D12_TEXTURE_LAYOUT_UNKNOWN;
-        desc.Flags = D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET | D3D12_RESOURCE_FLAG_ALLOW_SIMULTANEOUS_ACCESS;
-        if (FAILED(device12->CreateCommittedResource(&heap, D3D12_HEAP_FLAG_SHARED, &desc, D3D12_RESOURCE_STATE_COMMON, nullptr,
-                __uuidof(ID3D12Resource), (void**)&_shared12))) {
-            Log(reshade::log::level::error, "Could not create the shared back buffer (%ux%u format %u).", width, height, (unsigned)desc.Format);
+        if (!CreateTexture12(width, height, _gameDesc.BufferDesc.Format,
+                D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET | D3D12_RESOURCE_FLAG_ALLOW_SIMULTANEOUS_ACCESS,
+                D3D12_HEAP_FLAG_SHARED, D3D12_RESOURCE_STATE_COMMON, _shared12)) {
+            Log(reshade::log::level::error, "Could not create the shared back buffer (%ux%u format %u).", width, height, (unsigned)_gameDesc.BufferDesc.Format);
             return false;
         }
         HANDLE sharedHandle = nullptr;
@@ -408,11 +910,32 @@ private:
         }
         _gameDesc.BufferDesc.Width = width;
         _gameDesc.BufferDesc.Height = height;
+        backBuffer11 = _shared11.get();
+        return true;
+    }
+
+    // Output textures of Frame Generation (same size/format as the back buffer).
+    bool EnsureSlots() {
+        if (_slots[0].generated && _slots[0].real) {
+            return true;
+        }
+        for (Slot& slot : _slots) {
+            if (!CreateTexture12(_gameDesc.BufferDesc.Width, _gameDesc.BufferDesc.Height, _gameDesc.BufferDesc.Format,
+                    D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS, D3D12_HEAP_FLAG_NONE, D3D12_RESOURCE_STATE_UNORDERED_ACCESS, slot.generated) ||
+                !CreateTexture12(_gameDesc.BufferDesc.Width, _gameDesc.BufferDesc.Height, _gameDesc.BufferDesc.Format,
+                    D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS, D3D12_HEAP_FLAG_NONE, D3D12_RESOURCE_STATE_UNORDERED_ACCESS, slot.real)) {
+                ReleaseSlots();
+                return false;
+            }
+        }
         return true;
     }
 
     HRESULT Resize(UINT bufferCount, UINT width, UINT height, DXGI_FORMAT format, UINT flags) {
+        DrainPresenter();
+        ReleaseFrameGenerationFeature();
         FlushGpu();
+        ReleaseSlots();
         ReleaseBuffers();
 
         DXGI_FORMAT gameFormat = format != DXGI_FORMAT_UNKNOWN ? format : _gameDesc.BufferDesc.Format;
@@ -422,7 +945,11 @@ private:
             return DXGI_ERROR_INVALID_CALL;
         }
         _realFlags = flags | (tearingSupported ? DXGI_SWAP_CHAIN_FLAG_ALLOW_TEARING : 0);
-        HRESULT hr = _real->ResizeBuffers(_realBufferCount, width, height, realFormat, _realFlags);
+        HRESULT hr;
+        {
+            std::lock_guard<std::mutex> lock(queueMutex);
+            hr = _real->ResizeBuffers(_realBufferCount, width, height, realFormat, _realFlags);
+        }
         if (FAILED(hr)) {
             Log(reshade::log::level::error, "ResizeBuffers failed (0x%08X).", (unsigned)hr);
             return hr;
@@ -435,7 +962,20 @@ private:
         if (!CreateBuffers()) {
             return E_FAIL;
         }
+        _frameGenerationWasRunning = false;
         return S_OK;
+    }
+
+    void MeasureFrameInterval() {
+        LARGE_INTEGER now;
+        QueryPerformanceCounter(&now);
+        if (_lastFrameTime.QuadPart != 0) {
+            double interval = (double)(now.QuadPart - _lastFrameTime.QuadPart) / (double)_qpcFrequency.QuadPart;
+            if (interval > 0.002 && interval < 0.2) {
+                _frameInterval = _frameInterval <= 0.0 ? interval : _frameInterval * 0.9 + interval * 0.1;
+            }
+        }
+        _lastFrameTime = now;
     }
 
     HRESULT PresentFrame(UINT syncInterval, UINT flags) {
@@ -446,60 +986,319 @@ private:
             return DXGI_ERROR_INVALID_CALL;
         }
 
-        // 1. The game finished drawing into the shared back buffer (DX11).
-        uint64_t gameFrameDone = ++fenceValue;
-        context11->Signal(fence11.get(), gameFrameDone);
-        context11->Flush();
+        // End of a frame rendered by the game: let the add-on do its per-frame work.
+        if (onGameFrameEnd) {
+            onGameFrameEnd((uint64_t)_shared11.get(), _gameDesc.BufferDesc.Width, _gameDesc.BufferDesc.Height);
+        }
+        MeasureFrameInterval();
 
-        // 2. DX12 waits for it, then copies it into the current DX12 back buffer.
-        queue12->Wait(fence12.get(), gameFrameDone);
+        FrameInputs inputs = frameInputs;
+        frameInputs.valid = false;
+        frameInputs.hudlessValid = false;
+        if (frameGenerationRetry.exchange(false)) {
+            _frameGenerationFailed = false;
+        }
 
-        const int slot = (int)(_frameCounter++ % kFrames);
-        WaitForFence(_allocatorFence[slot]);
-        _allocators[slot]->Reset();
-        _commandList->Reset(_allocators[slot].get(), nullptr);
-
-        UINT index = _real->GetCurrentBackBufferIndex();
-        ID3D12Resource* backBuffer = _backBuffers12[index < _backBuffers12.size() ? index : 0].get();
-
-        D3D12_RESOURCE_BARRIER barrier = {};
-        barrier.Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
-        barrier.Transition.pResource = backBuffer;
-        barrier.Transition.Subresource = D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES;
-        barrier.Transition.StateBefore = D3D12_RESOURCE_STATE_PRESENT;
-        barrier.Transition.StateAfter = D3D12_RESOURCE_STATE_COPY_DEST;
-        _commandList->ResourceBarrier(1, &barrier);
-        _commandList->CopyResource(backBuffer, _shared12.get());
-        barrier.Transition.StateBefore = D3D12_RESOURCE_STATE_COPY_DEST;
-        barrier.Transition.StateAfter = D3D12_RESOURCE_STATE_PRESENT;
-        _commandList->ResourceBarrier(1, &barrier);
-        _commandList->Close();
-        ID3D12CommandList* lists[] = { _commandList.get() };
-        queue12->ExecuteCommandLists(1, lists);
-
-        // 3. Present (ReShade draws its menu/effects here).
-        UINT presentFlags = flags & (DXGI_PRESENT_DO_NOT_WAIT | DXGI_PRESENT_RESTART);
-        if (syncInterval == 0 && tearingSupported) {
-            BOOL fullscreen = FALSE;
-            _real->GetFullscreenState(&fullscreen, nullptr);
-            if (!fullscreen) {
-                presentFlags |= DXGI_PRESENT_ALLOW_TEARING;
+        if (frameGenerationEnabled && inputs.valid && !_frameGenerationFailed) {
+            if (PresentWithFrameGeneration(syncInterval, flags, inputs)) {
+                return S_OK;
             }
         }
-        inGameFramePresent = true;
-        HRESULT hr = _real->Present(syncInterval, presentFlags);
-        inGameFramePresent = false;
+        else if (!frameGenerationEnabled) {
+            frameGenerationStatus = "off";
+        }
+        else if (!inputs.valid && frameGenerationEnabled && !_frameGenerationFailed) {
+            frameGenerationStatus = "waiting (no 3D scene this frame: menu, loading or video)";
+        }
 
-        // 4. The game may only draw into the shared back buffer again after the copy finished.
-        uint64_t copyDone = ++fenceValue;
-        queue12->Signal(fence12.get(), copyDone);
-        _allocatorFence[slot] = copyDone;
-        context11->Wait(fence11.get(), copyDone);
+        frameGenerationRunning = false;
+        _frameGenerationWasRunning = false;
+        DrainPresenter();
+        return PresentDirect(syncInterval, flags);
+    }
+
+    // Frame Generation off: copy the game's frame and present it right away.
+    HRESULT PresentDirect(UINT syncInterval, UINT flags) {
+        uint64_t gameFrameDone = SignalFromD3D11();
+        HRESULT hr;
+        uint64_t copyDone;
+        {
+            std::lock_guard<std::mutex> lock(queueMutex);
+            queue12->Wait(fence11to12.get(), gameFrameDone);
+
+            int ringIndex = BeginCommands(_renderRing);
+            ID3D12GraphicsCommandList* list = _renderRing.list.get();
+            UINT index = _real->GetCurrentBackBufferIndex();
+            ID3D12Resource* backBuffer = _backBuffers12[index < _backBuffers12.size() ? index : 0].get();
+            Transition(list, backBuffer, D3D12_RESOURCE_STATE_PRESENT, D3D12_RESOURCE_STATE_COPY_DEST);
+            list->CopyResource(backBuffer, _shared12.get());
+            Transition(list, backBuffer, D3D12_RESOURCE_STATE_COPY_DEST, D3D12_RESOURCE_STATE_PRESENT);
+            list->Close();
+            ID3D12CommandList* lists[] = { list };
+            queue12->ExecuteCommandLists(1, lists);
+
+            hr = _real->Present(syncInterval, PresentFlags(syncInterval, flags));
+
+            copyDone = SignalQueueLocked();
+            _renderRing.allocatorFence[ringIndex] = copyDone;
+        }
+        // The game may only draw into the shared back buffer again after the copy finished.
+        context11->Wait(fence12_11.get(), copyDone);
 
         if (FAILED(hr) && hr != DXGI_ERROR_WAS_STILL_DRAWING) {
             Log(reshade::log::level::warning, "Present failed (0x%08X).", (unsigned)hr);
         }
         return hr;
+    }
+
+    // Frame Generation on: generate the in-between frame and hand both frames to the presenter.
+    // Returns false if this frame must be presented without Frame Generation.
+    bool PresentWithFrameGeneration(UINT syncInterval, UINT flags, const FrameInputs& inputs) {
+        if (!InitNGX12()) {
+            _frameGenerationFailed = true;
+            return false;
+        }
+        if (!depthShared.resource12 || !motionShared.resource12 ||
+            depthShared.width != inputs.renderWidth || depthShared.height != inputs.renderHeight) {
+            return false;
+        }
+        if (!EnsureSlots()) {
+            frameGenerationStatus = "failed: could not create the output textures";
+            _frameGenerationFailed = true;
+            return false;
+        }
+
+        const uint32_t width = _gameDesc.BufferDesc.Width;
+        const uint32_t height = _gameDesc.BufferDesc.Height;
+        const DXGI_FORMAT format = _gameDesc.BufferDesc.Format;
+        bool recreate = fgHandle && (fgWidth != width || fgHeight != height || fgFormat != format ||
+            fgRenderWidth != inputs.renderWidth || fgRenderHeight != inputs.renderHeight);
+        if (recreate) {
+            DrainPresenter();
+            ReleaseFrameGenerationFeature();
+            _frameGenerationWasRunning = false;
+        }
+
+        // Wait for a free slot (the presenter may still be showing the slot from two frames ago).
+        int slotIndex = _nextSlot;
+        _nextSlot = (_nextSlot + 1) % kSlots;
+        Slot& slot = _slots[slotIndex];
+        {
+            std::unique_lock<std::mutex> lock(_slotMutex);
+            if (!_slotCv.wait_for(lock, std::chrono::milliseconds(500), [&]() { return !slot.queued; })) {
+                Log(reshade::log::level::warning, "Presenter thread is stuck; presenting without Frame Generation.");
+                return false;
+            }
+        }
+        WaitForFence12(slot.freeFence);
+
+        uint64_t gameFrameDone = SignalFromD3D11();
+        bool generated = false;
+        bool createdThisFrameOuter = false;
+        uint64_t workDone;
+        {
+            std::lock_guard<std::mutex> lock(queueMutex);
+            queue12->Wait(fence11to12.get(), gameFrameDone);
+
+            int ringIndex = BeginCommands(_renderRing);
+            ID3D12GraphicsCommandList* list = _renderRing.list.get();
+
+            bool createdThisFrame = false;
+            if (!fgHandle) {
+                createdThisFrame = true;
+                NVSDK_NGX_DLSSG_Create_Params createParams = {};
+                createParams.Width = width;
+                createParams.Height = height;
+                createParams.NativeBackbufferFormat = (unsigned int)format;
+                createParams.RenderWidth = inputs.renderWidth;
+                createParams.RenderHeight = inputs.renderHeight;
+                createParams.DynamicResolutionScaling = false;
+                if (NVSDK_NGX_FAILED(NGX_D3D12_CREATE_DLSSG(list, 1, 1, &fgHandle, fgParameters, &createParams)) || !fgHandle) {
+                    fgHandle = nullptr;
+                    frameGenerationStatus = "failed: DLSS Frame Generation could not be created";
+                    Log(reshade::log::level::error, "DLSS Frame Generation feature creation failed (%ux%u, render %ux%u).",
+                        width, height, inputs.renderWidth, inputs.renderHeight);
+                    _frameGenerationFailed = true;
+                }
+                else {
+                    fgWidth = width;
+                    fgHeight = height;
+                    fgFormat = format;
+                    fgRenderWidth = inputs.renderWidth;
+                    fgRenderHeight = inputs.renderHeight;
+                    Log(reshade::log::level::info, "DLSS Frame Generation created (%ux%u, render %ux%u).", width, height, inputs.renderWidth, inputs.renderHeight);
+                }
+            }
+
+            ID3D12Resource* readInputs[] = { _shared12.get(), depthShared.resource12.get(), motionShared.resource12.get(),
+                inputs.hudlessValid ? hudlessShared.resource12.get() : nullptr };
+            // On the frame the feature is created, only the real frame is shown.
+            createdThisFrameOuter = createdThisFrame;
+            bool evaluate = fgHandle && !createdThisFrame;
+            if (evaluate) {
+                for (ID3D12Resource* resource : readInputs) {
+                    if (resource) {
+                        Transition(list, resource, D3D12_RESOURCE_STATE_COMMON, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
+                    }
+                }
+
+                NVSDK_NGX_D3D12_DLSSG_Eval_Params evalParams = {};
+                evalParams.pBackbuffer = _shared12.get();
+                evalParams.pDepth = depthShared.resource12.get();
+                evalParams.pMVecs = motionShared.resource12.get();
+                evalParams.pHudless = inputs.hudlessValid ? hudlessShared.resource12.get() : nullptr;
+                evalParams.pOutputInterpFrame = slot.generated.get();
+                evalParams.pOutputRealFrame = slot.real.get();
+
+                NVSDK_NGX_DLSSG_Opt_Eval_Params optParams = {};
+                optParams.multiFrameCount = 1;
+                optParams.multiFrameIndex = 1;
+                CopyMatrixForDLSS(inputs.viewToClip, optParams.cameraViewToClip);
+                CopyMatrixForDLSS(inputs.clipToView, optParams.clipToCameraView);
+                CopyMatrixForDLSS(inputs.clipToPrevClip, optParams.clipToPrevClip);
+                CopyMatrixForDLSS(inputs.prevClipToClip, optParams.prevClipToClip);
+                for (int i = 0; i < 4; ++i) {
+                    optParams.clipToLensClip[i][i] = 1.0f;
+                }
+                optParams.mvecScale[0] = 1.0f;
+                optParams.mvecScale[1] = 1.0f;
+                optParams.cameraUp[1] = 1.0f;
+                optParams.cameraRight[0] = 1.0f;
+                optParams.cameraFwd[2] = 1.0f;
+                optParams.cameraNear = inputs.nearPlane;
+                optParams.cameraFar = inputs.farPlane;
+                optParams.cameraFOV = inputs.fov;
+                optParams.cameraAspectRatio = inputs.aspect;
+                optParams.colorBuffersHDR = false;
+                optParams.depthInverted = inputs.depthInverted;
+                optParams.cameraMotionIncluded = true;
+                optParams.reset = !_frameGenerationWasRunning;
+                optParams.menuDetectionEnabled = true;
+
+                generated = NVSDK_NGX_SUCCEED(NGX_D3D12_EVALUATE_DLSSG(list, fgHandle, fgParameters, &evalParams, &optParams));
+
+                for (ID3D12Resource* resource : readInputs) {
+                    if (resource) {
+                        Transition(list, resource, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE, D3D12_RESOURCE_STATE_COMMON);
+                    }
+                }
+            }
+            if (!generated) {
+                // Keep a copy of the real frame so the presenter can still show it.
+                Transition(list, slot.real.get(), D3D12_RESOURCE_STATE_UNORDERED_ACCESS, D3D12_RESOURCE_STATE_COPY_DEST);
+                list->CopyResource(slot.real.get(), _shared12.get());
+                Transition(list, slot.real.get(), D3D12_RESOURCE_STATE_COPY_DEST, D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
+            }
+
+            list->Close();
+            ID3D12CommandList* lists[] = { list };
+            queue12->ExecuteCommandLists(1, lists);
+            workDone = SignalQueueLocked();
+            _renderRing.allocatorFence[ringIndex] = workDone;
+        }
+        // DirectX 11 may overwrite the back buffer, depth and motion vectors once DX12 read them.
+        context11->Wait(fence12_11.get(), workDone);
+
+        if (generated) {
+            frameGenerationRunning = true;
+            frameGenerationStatus = "running (2x)";
+        }
+        else if (fgHandle && !createdThisFrameOuter) {
+            frameGenerationStatus = "failed: DLSS Frame Generation evaluation failed";
+            Log(reshade::log::level::error, "DLSS Frame Generation evaluation failed; turning it off for this session.");
+            _frameGenerationFailed = true;
+        }
+        _frameGenerationWasRunning = generated;
+
+        {
+            std::lock_guard<std::mutex> lock(_slotMutex);
+            slot.queued = true;
+        }
+        {
+            std::lock_guard<std::mutex> lock(_jobMutex);
+            _jobs.push_back(Job{ slotIndex, generated, syncInterval, flags, _frameInterval });
+        }
+        _jobCv.notify_all();
+        return true;
+    }
+
+    // Copies a texture (UNORDERED_ACCESS state) into the current back buffer and presents it.
+    uint64_t PresentTexture(ID3D12Resource* source, UINT syncInterval, UINT flags) {
+        std::lock_guard<std::mutex> lock(queueMutex);
+        int ringIndex = BeginCommands(_presentRing);
+        ID3D12GraphicsCommandList* list = _presentRing.list.get();
+        UINT index = _real->GetCurrentBackBufferIndex();
+        ID3D12Resource* backBuffer = _backBuffers12[index < _backBuffers12.size() ? index : 0].get();
+        Transition(list, backBuffer, D3D12_RESOURCE_STATE_PRESENT, D3D12_RESOURCE_STATE_COPY_DEST);
+        Transition(list, source, D3D12_RESOURCE_STATE_UNORDERED_ACCESS, D3D12_RESOURCE_STATE_COPY_SOURCE);
+        list->CopyResource(backBuffer, source);
+        Transition(list, source, D3D12_RESOURCE_STATE_COPY_SOURCE, D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
+        Transition(list, backBuffer, D3D12_RESOURCE_STATE_COPY_DEST, D3D12_RESOURCE_STATE_PRESENT);
+        list->Close();
+        ID3D12CommandList* lists[] = { list };
+        queue12->ExecuteCommandLists(1, lists);
+
+        HRESULT hr = _real->Present(syncInterval, PresentFlags(syncInterval, flags));
+        if (FAILED(hr) && hr != DXGI_ERROR_WAS_STILL_DRAWING) {
+            Log(reshade::log::level::warning, "Present failed (0x%08X).", (unsigned)hr);
+        }
+        uint64_t done = SignalQueueLocked();
+        _presentRing.allocatorFence[ringIndex] = done;
+        return done;
+    }
+
+    // Presenter thread: shows the generated frame, then the real frame half a frame later.
+    void PresenterLoop() {
+        LARGE_INTEGER frequency;
+        QueryPerformanceFrequency(&frequency);
+        for (;;) {
+            Job job;
+            {
+                std::unique_lock<std::mutex> lock(_jobMutex);
+                _jobCv.wait(lock, [&]() { return _quit || !_jobs.empty(); });
+                if (_jobs.empty()) {
+                    break; // quitting
+                }
+                job = _jobs.front();
+                _jobs.pop_front();
+            }
+            Slot& slot = _slots[job.slot];
+
+            if (job.hasGenerated) {
+                PresentTexture(slot.generated.get(), job.syncInterval, job.flags);
+                if (job.syncInterval == 0 && job.frameInterval > 0.0) {
+                    // Pace: the real frame goes half a frame after the generated one,
+                    // unless the game already finished its next frame.
+                    double wait = job.frameInterval * 0.5;
+                    if (wait > 0.05) {
+                        wait = 0.05;
+                    }
+                    std::unique_lock<std::mutex> lock(_jobMutex);
+                    _jobCv.wait_for(lock, std::chrono::duration<double>(wait), [&]() { return _quit || !_jobs.empty(); });
+                }
+            }
+            uint64_t done = PresentTexture(slot.real.get(), job.syncInterval, job.flags);
+
+            {
+                std::lock_guard<std::mutex> lock(_slotMutex);
+                slot.freeFence = done;
+                slot.queued = false;
+            }
+            _slotCv.notify_all();
+        }
+    }
+
+    // Waits until the presenter thread has shown everything handed to it.
+    void DrainPresenter() {
+        std::unique_lock<std::mutex> lock(_slotMutex);
+        _slotCv.wait_for(lock, std::chrono::milliseconds(1000), [&]() {
+            for (const Slot& slot : _slots) {
+                if (slot.queued) {
+                    return false;
+                }
+            }
+            return true;
+        });
     }
 
     volatile LONG _ref = 1;
@@ -513,10 +1312,26 @@ private:
     com_ptr<ID3D12Resource> _shared12;
     com_ptr<ID3D11Texture2D> _shared11;
     std::vector<com_ptr<ID3D12Resource>> _backBuffers12;
-    com_ptr<ID3D12CommandAllocator> _allocators[kFrames];
-    uint64_t _allocatorFence[kFrames] = {};
-    com_ptr<ID3D12GraphicsCommandList> _commandList;
-    uint64_t _frameCounter = 0;
+
+    CommandRing _renderRing;  // used by the game's render thread
+    CommandRing _presentRing; // used by the presenter thread
+
+    Slot _slots[kSlots];
+    int _nextSlot = 0;
+    std::mutex _slotMutex;
+    std::condition_variable _slotCv;
+
+    std::thread _presenter;
+    std::mutex _jobMutex;
+    std::condition_variable _jobCv;
+    std::deque<Job> _jobs;
+    bool _quit = false;
+
+    LARGE_INTEGER _qpcFrequency = {};
+    LARGE_INTEGER _lastFrameTime = {};
+    double _frameInterval = 0.0;
+    bool _frameGenerationWasRunning = false;
+    bool _frameGenerationFailed = false;
 };
 
 // Replaces IDXGIFactory::CreateSwapChain (vtable slot 10). Runs before ReShade's own hook.
