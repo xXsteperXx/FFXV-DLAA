@@ -54,9 +54,15 @@ inline std::atomic<bool> frameGenerationRetry = false;  // set by the menu when 
 inline std::atomic<const char*> frameGenerationProblem = ""; // last problem preparing the inputs (kept until fixed)
 
 // Latency settings (menu)
-inline std::atomic<bool> reflexEnabled = true;   // NVIDIA Reflex low latency mode on the game's device
+inline std::atomic<bool> reflexEnabled = false;  // NVIDIA Reflex on the game's device (Community Shaders disables it with a DX12 bridge too)
 inline std::atomic<bool> reflexBoost = false;    // Reflex boost (GPU clocks kept high)
 inline std::atomic<int> framesAhead = 1;         // frames the game may prepare ahead of the GPU (0..2)
+inline std::atomic<int> displayQueue = 1;        // frames DXGI may queue for the display (1..3), like Community Shaders' waitable
+
+// Display information (menu)
+inline std::atomic<uint32_t> infoSyncInterval = 0;   // V-Sync requested by the game (0 = off)
+inline std::atomic<bool> infoTearing = false;        // presents allowed to tear (V-Sync off, borderless)
+inline std::atomic<uint32_t> infoRefreshRate = 0;    // monitor refresh rate in Hz
 
 // Statistics (menu)
 inline std::atomic<uint64_t> statGenerated = 0;     // frames with a generated frame
@@ -731,6 +737,10 @@ public:
         if (!CreateBuffers()) {
             return false;
         }
+        // Limit how many frames DXGI may queue for the display (lower input lag).
+        _latencyWaitable = _real->GetFrameLatencyWaitableObject();
+        ApplyDisplayQueue();
+        UpdateRefreshRate();
         _presenter = std::thread([this]() { PresenterLoop(); });
         return true;
     }
@@ -899,6 +909,10 @@ private:
         FlushGpu();
         ReleaseSlots();
         ReleaseBuffers();
+        if (_latencyWaitable) {
+            CloseHandle(_latencyWaitable);
+            _latencyWaitable = nullptr;
+        }
         bridgeActive = false;
         frameGenerationRunning = false;
         backBuffer11 = nullptr;
@@ -940,13 +954,17 @@ private:
 
     UINT PresentFlags(UINT syncInterval, UINT flags) {
         UINT presentFlags = flags & (DXGI_PRESENT_DO_NOT_WAIT | DXGI_PRESENT_RESTART);
+        bool tearing = false;
         if (syncInterval == 0 && tearingSupported) {
             BOOL fullscreen = FALSE;
             _real->GetFullscreenState(&fullscreen, nullptr);
             if (!fullscreen) {
                 presentFlags |= DXGI_PRESENT_ALLOW_TEARING;
+                tearing = true;
             }
         }
+        infoSyncInterval = syncInterval;
+        infoTearing = tearing;
         return presentFlags;
     }
 
@@ -1036,7 +1054,8 @@ private:
             Log(reshade::log::level::error, "ResizeBuffers with unsupported format %u.", (unsigned)gameFormat);
             return DXGI_ERROR_INVALID_CALL;
         }
-        _realFlags = flags | (tearingSupported ? DXGI_SWAP_CHAIN_FLAG_ALLOW_TEARING : 0);
+        _realFlags = flags | DXGI_SWAP_CHAIN_FLAG_FRAME_LATENCY_WAITABLE_OBJECT |
+            (tearingSupported ? DXGI_SWAP_CHAIN_FLAG_ALLOW_TEARING : 0);
         HRESULT hr;
         {
             std::lock_guard<std::mutex> lock(queueMutex);
@@ -1055,6 +1074,7 @@ private:
             return E_FAIL;
         }
         _frameGenerationWasRunning = false;
+        UpdateRefreshRate();
         return S_OK;
     }
 
@@ -1068,6 +1088,45 @@ private:
             }
         }
         _lastFrameTime = now;
+    }
+
+    void ApplyDisplayQueue() {
+        int queue = displayQueue;
+        if (queue < 1) {
+            queue = 1;
+        }
+        if (queue > 3) {
+            queue = 3;
+        }
+        if (queue != _appliedDisplayQueue) {
+            std::lock_guard<std::mutex> lock(queueMutex);
+            if (SUCCEEDED(_real->SetMaximumFrameLatency((UINT)queue))) {
+                _appliedDisplayQueue = queue;
+            }
+        }
+    }
+
+    // Waits until DXGI accepts one more frame for the display. Call before Present, outside queueMutex.
+    void WaitForDisplaySlot() {
+        ApplyDisplayQueue();
+        if (_latencyWaitable) {
+            WaitForSingleObjectEx(_latencyWaitable, 100, TRUE);
+        }
+    }
+
+    void UpdateRefreshRate() {
+        HWND hwnd = nullptr;
+        if (FAILED(_real->GetHwnd(&hwnd)) || !hwnd) {
+            return;
+        }
+        MONITORINFOEXW info = {};
+        info.cbSize = sizeof(info);
+        DEVMODEW mode = {};
+        mode.dmSize = sizeof(mode);
+        if (GetMonitorInfoW(MonitorFromWindow(hwnd, MONITOR_DEFAULTTONEAREST), &info) &&
+            EnumDisplaySettingsW(info.szDevice, ENUM_CURRENT_SETTINGS, &mode)) {
+            infoRefreshRate = mode.dmDisplayFrequency;
+        }
     }
 
     static double QpcSeconds(const LARGE_INTEGER& from, const LARGE_INTEGER& to, const LARGE_INTEGER& frequency) {
@@ -1221,6 +1280,7 @@ private:
     // Frame Generation off: copy the game's frame and present it right away.
     HRESULT PresentDirect(UINT syncInterval, UINT flags, uint64_t& copyDone) {
         uint64_t gameFrameDone = SignalFromD3D11();
+        WaitForDisplaySlot();
         HRESULT hr;
         {
             std::lock_guard<std::mutex> lock(queueMutex);
@@ -1441,6 +1501,7 @@ private:
 
     // Copies a texture (UNORDERED_ACCESS state) into the current back buffer and presents it.
     uint64_t PresentTexture(ID3D12Resource* source, UINT syncInterval, UINT flags) {
+        WaitForDisplaySlot();
         std::lock_guard<std::mutex> lock(queueMutex);
         int ringIndex = BeginCommands(_presentRing);
         ID3D12GraphicsCommandList* list = _presentRing.list.get();
@@ -1588,6 +1649,8 @@ private:
     static constexpr int kHistory = 4;
     uint64_t _submittedHistory[kHistory] = {};
     uint64_t _submittedCount = 0;
+    HANDLE _latencyWaitable = nullptr;
+    int _appliedDisplayQueue = 0;
     bool _reflexApplied = false;
     bool _reflexOn = false;
     bool _reflexBoostOn = false;
@@ -1630,7 +1693,8 @@ inline HRESULT STDMETHODCALLTYPE CreateSwapChainHook(IDXGIFactory* factory, IUnk
     realDesc.BufferUsage = DXGI_USAGE_RENDER_TARGET_OUTPUT;
     realDesc.BufferCount = 3;
     realDesc.SwapEffect = DXGI_SWAP_EFFECT_FLIP_DISCARD;
-    realDesc.Flags = desc->Flags | (tearingSupported ? DXGI_SWAP_CHAIN_FLAG_ALLOW_TEARING : 0);
+    realDesc.Flags = desc->Flags | DXGI_SWAP_CHAIN_FLAG_FRAME_LATENCY_WAITABLE_OBJECT |
+        (tearingSupported ? DXGI_SWAP_CHAIN_FLAG_ALLOW_TEARING : 0);
 
     IDXGISwapChain* realSwapChain = nullptr;
     HRESULT hr = previousCreateSwapChain(factory, queue12.get(), &realDesc, &realSwapChain);
