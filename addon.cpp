@@ -823,8 +823,19 @@ static void drawSettings(reshade::api::effect_runtime*)
         }
 
         // Latency
+        // Display information: the biggest influences on input lag with Frame Generation.
+        ImGui::Text("Game V-Sync: %s | tearing: %s | monitor: %u Hz",
+            fg::infoSyncInterval.load() ? "ON (adds lag with Frame Generation)" : "off",
+            fg::infoTearing ? "allowed" : "no", fg::infoRefreshRate.load());
+        int displayQueue = fg::displayQueue - 1;
+        const char* displayQueueNames[] = { "1 frame (lowest lag)", "2 frames", "3 frames (Windows default)" };
+        if (ImGui::Combo("Display queue", &displayQueue, displayQueueNames, 3)) {
+            fg::displayQueue = displayQueue + 1;
+            reshade::set_config_value(nullptr, "DLAA", "DisplayQueue", displayQueue + 1);
+        }
+
         bool reflexOn = fg::reflexEnabled;
-        if (ImGui::Checkbox("NVIDIA Reflex (low latency)", &reflexOn)) {
+        if (ImGui::Checkbox("NVIDIA Reflex (little or no effect with the DX12 bridge)", &reflexOn)) {
             fg::reflexEnabled = reflexOn;
             reshade::set_config_value(nullptr, "DLAA", "Reflex", reflexOn);
         }
@@ -910,9 +921,12 @@ void OnInitDevice(reshade::api::device* device) {
         reshade::get_config_value(nullptr, "DLAA", "FrameGeneration", frameGeneration);
         reshade::get_config_value(nullptr, "DLAA", "FGTransposeMatrices", transpose);
         reshade::get_config_value(nullptr, "DLAA", "FGDepthInverted", depthMode);
-        bool reflexOn = true;
+        bool reflexOn = false;
         bool reflexBoost = false;
         int framesAhead = 1;
+        int displayQueue = 1;
+        reshade::get_config_value(nullptr, "DLAA", "DisplayQueue", displayQueue);
+        fg::displayQueue = (displayQueue >= 1 && displayQueue <= 3) ? displayQueue : 1;
         reshade::get_config_value(nullptr, "DLAA", "Reflex", reflexOn);
         reshade::get_config_value(nullptr, "DLAA", "ReflexBoost", reflexBoost);
         reshade::get_config_value(nullptr, "DLAA", "FramesAhead", framesAhead);
