@@ -827,40 +827,36 @@ static void drawSettings(reshade::api::effect_runtime*)
         ImGui::Text("Game V-Sync: %s | tearing: %s | monitor: %u Hz",
             fg::infoSyncInterval.load() ? "ON (adds lag with Frame Generation)" : "off",
             fg::infoTearing ? "allowed" : "no", fg::infoRefreshRate.load());
+        int latencyMode = fg::latencyMode;
+        const char* latencyModeNames[] = {
+            "Off (most input lag)",
+            "Basic (game at most 1 frame ahead)",
+            "Automatic - LatencyFleX (like Reflex)" };
+        if (ImGui::Combo("Input lag reduction", &latencyMode, latencyModeNames, 3)) {
+            fg::latencyMode = latencyMode;
+            reshade::set_config_value(nullptr, "DLAA", "LatencyMode", latencyMode);
+        }
         int displayQueue = fg::displayQueue - 1;
         const char* displayQueueNames[] = { "1 frame (lowest lag)", "2 frames", "3 frames (Windows default)" };
-        if (ImGui::Combo("Display queue", &displayQueue, displayQueueNames, 3)) {
+        if (ImGui::Combo("Display queue (matters with V-Sync)", &displayQueue, displayQueueNames, 3)) {
             fg::displayQueue = displayQueue + 1;
             reshade::set_config_value(nullptr, "DLAA", "DisplayQueue", displayQueue + 1);
         }
 
-        bool reflexOn = fg::reflexEnabled;
-        if (ImGui::Checkbox("NVIDIA Reflex (little or no effect with the DX12 bridge)", &reflexOn)) {
-            fg::reflexEnabled = reflexOn;
-            reshade::set_config_value(nullptr, "DLAA", "Reflex", reflexOn);
-        }
-        if (reflexOn) {
-            ImGui::SameLine();
-            bool boost = fg::reflexBoost;
-            if (ImGui::Checkbox("+ Boost", &boost)) {
-                fg::reflexBoost = boost;
-                reshade::set_config_value(nullptr, "DLAA", "ReflexBoost", boost);
-            }
-        }
-        ImGui::Text("Reflex: %s", reflex::status.load());
-        int framesAhead = fg::framesAhead;
-        const char* framesAheadNames[] = { "0 (lowest lag, lower FPS)", "1 (recommended)", "2 (highest FPS, more lag)" };
-        if (ImGui::Combo("Frames prepared ahead", &framesAhead, framesAheadNames, 3)) {
-            fg::framesAhead = framesAhead;
-            reshade::set_config_value(nullptr, "DLAA", "FramesAhead", framesAhead);
-        }
-
         // Statistics, to find the cause of stutters
+        float frameTimeMs = fg::statFrameTimeMs.load();
+        ImGui::Text("Game frames: %.1f ms each (%.0f FPS before generation), variation %.1f ms",
+            frameTimeMs, frameTimeMs > 0.0f ? 1000.0f / frameTimeMs : 0.0f, fg::statFrameJitterMs.load());
+        if (fg::latencyMode == fg::kLatencyAutomatic) {
+            ImGui::Text("LatencyFleX: frame start to GPU done %.1f ms, wait added %.1f ms",
+                fg::statLatencyMs.load(), fg::statLatencySleepMs.load());
+        }
         ImGui::Text("Frames: %llu with a generated frame, %llu without (camera reused %llu times)",
             (unsigned long long)fg::statGenerated.load(), (unsigned long long)fg::statNotGenerated.load(),
             (unsigned long long)fg::statCameraReused.load());
         ImGui::Text("Last frame without generation: %s", fg::statLastSkipReason.load());
-        ImGui::Text("Longest wait in Present (last 2 s): %.1f ms", fg::statLongestFrameMs.load());
+        ImGui::Text("Longest wait in Present (last 2 s): %.1f ms | real frames shown early: %llu",
+            fg::statLongestFrameMs.load(), (unsigned long long)fg::statLateFrames.load());
         if (ImGui::TreeNode("Frame Generation debug options")) {
             bool transpose = fg::transposeMatrices;
             if (ImGui::Checkbox("Transposed camera matrices (default: on)", &transpose)) {
@@ -921,18 +917,12 @@ void OnInitDevice(reshade::api::device* device) {
         reshade::get_config_value(nullptr, "DLAA", "FrameGeneration", frameGeneration);
         reshade::get_config_value(nullptr, "DLAA", "FGTransposeMatrices", transpose);
         reshade::get_config_value(nullptr, "DLAA", "FGDepthInverted", depthMode);
-        bool reflexOn = false;
-        bool reflexBoost = false;
-        int framesAhead = 1;
         int displayQueue = 1;
         reshade::get_config_value(nullptr, "DLAA", "DisplayQueue", displayQueue);
         fg::displayQueue = (displayQueue >= 1 && displayQueue <= 3) ? displayQueue : 1;
-        reshade::get_config_value(nullptr, "DLAA", "Reflex", reflexOn);
-        reshade::get_config_value(nullptr, "DLAA", "ReflexBoost", reflexBoost);
-        reshade::get_config_value(nullptr, "DLAA", "FramesAhead", framesAhead);
-        fg::reflexEnabled = reflexOn;
-        fg::reflexBoost = reflexBoost;
-        fg::framesAhead = (framesAhead >= 0 && framesAhead <= 2) ? framesAhead : 1;
+        int latencyMode = fg::kLatencyAutomatic;
+        reshade::get_config_value(nullptr, "DLAA", "LatencyMode", latencyMode);
+        fg::latencyMode = (latencyMode >= fg::kLatencyOff && latencyMode <= fg::kLatencyAutomatic) ? latencyMode : fg::kLatencyAutomatic;
         fg::frameGenerationEnabled = frameGeneration;
         fg::transposeMatrices = transpose;
         fg::depthInvertedMode = (depthMode >= -1 && depthMode <= 1) ? depthMode : -1;
