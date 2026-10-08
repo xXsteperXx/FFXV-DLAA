@@ -27,6 +27,7 @@
 #include <d3d12.h>
 #include <dxgi1_6.h>
 #include <nvsdk_ngx_helpers_dlssg.h>
+#include "reflex.hpp"
 #include <atomic>
 #include <cmath>
 #include <condition_variable>
@@ -51,11 +52,24 @@ inline std::atomic<const char*> frameGenerationStatus = "off";
 inline std::atomic<bool> frameGenerationRunning = false;
 inline std::atomic<bool> frameGenerationRetry = false;  // set by the menu when Frame Generation is switched on
 inline std::atomic<const char*> frameGenerationProblem = ""; // last problem preparing the inputs (kept until fixed)
+
+// Latency settings (menu)
+inline std::atomic<bool> reflexEnabled = true;   // NVIDIA Reflex low latency mode on the game's device
+inline std::atomic<bool> reflexBoost = false;    // Reflex boost (GPU clocks kept high)
+inline std::atomic<int> framesAhead = 1;         // frames the game may prepare ahead of the GPU (0..2)
+
+// Statistics (menu)
+inline std::atomic<uint64_t> statGenerated = 0;     // frames with a generated frame
+inline std::atomic<uint64_t> statNotGenerated = 0;  // frames presented without one while Frame Generation is on
+inline std::atomic<uint64_t> statCameraReused = 0;  // frames that reused the previous camera
+inline std::atomic<float> statLongestFrameMs = 0.0f; // longest time spent in Present (last ~2 s)
+inline std::atomic<const char*> statLastSkipReason = "-";
 inline std::atomic<uint32_t> multiFrameCountMax = 0;    // reported by the driver (1 = only 2x)
 inline std::atomic<bool> transposeMatrices = true;      // debug: matrix layout handed to DLSS-FG
 inline std::atomic<int> depthInvertedMode = -1;         // debug: -1 automatic, 0 no, 1 yes
 inline std::atomic<bool> lastDepthInverted = false;
 inline std::atomic<bool> lastCameraFromGame = false;
+inline std::atomic<bool> depthRangeFromGame = false;
 
 // Called on the game's render thread at the end of every frame the game rendered
 // (replaces ReShade's present event while the bridge is active).
@@ -580,20 +594,38 @@ inline bool ComputeCamera(const float* c, uint32_t renderWidth, uint32_t renderH
         }
     }
     if (!projectionFromGame) {
-        // Plausible defaults so DLSS-FG still gets a consistent projection.
-        const float n = 0.1f;
-        const float f = 10000.0f;
+        // Depth range from g_unprojectParams (c11): 1 / viewZ = c11.x * depth + c11.y
+        // (in FFXV: near 0.2, far 12500, depth not inverted). Field of view is estimated.
+        float n = 0.1f;
+        float f = 10000.0f;
+        bool inverted = false;
+        const float a = c[44];
+        const float b = c[45];
+        const float zAtZero = b > 0.0f ? 1.0f / b : -1.0f;
+        const float zAtOne = (a + b) > 0.0f ? 1.0f / (a + b) : 1.0e6f;
+        depthRangeFromGame = std::isfinite(zAtZero) && zAtZero > 0.0f && std::isfinite(zAtOne) && std::fabs(zAtOne - zAtZero) > 1e-3f;
+        if (depthRangeFromGame) {
+            inverted = zAtZero > zAtOne;
+            n = inverted ? zAtOne : zAtZero;
+            f = inverted ? zAtZero : zAtOne;
+            if (f > 1.0e6f) {
+                f = 1.0e6f;
+            }
+        }
         const float fov = 1.0f; // about 57 degrees vertical
         const float aspect = renderHeight ? (float)renderWidth / (float)renderHeight : 1.777f;
         const float yScale = 1.0f / std::tan(fov * 0.5f);
-        float p[4][4] = { { yScale / aspect, 0, 0, 0 }, { 0, yScale, 0, 0 }, { 0, 0, f / (f - n), -n * f / (f - n) }, { 0, 0, 1, 0 } };
+        // Depth = A + B / viewZ: 0 at near and 1 at far (or the opposite when inverted).
+        const float depthA = inverted ? -n / (f - n) : f / (f - n);
+        const float depthB = inverted ? n * f / (f - n) : -n * f / (f - n);
+        float p[4][4] = { { yScale / aspect, 0, 0, 0 }, { 0, yScale, 0, 0 }, { 0, 0, depthA, depthB }, { 0, 0, 1, 0 } };
         memcpy(inputs.viewToClip, p, sizeof(p));
         Invert(inputs.viewToClip, inputs.clipToView);
         inputs.nearPlane = n;
         inputs.farPlane = f;
         inputs.fov = fov;
         inputs.aspect = aspect;
-        inputs.depthInverted = false;
+        inputs.depthInverted = inverted;
     }
     int mode = depthInvertedMode;
     if (mode == 0 || mode == 1) {
@@ -1038,6 +1070,82 @@ private:
         _lastFrameTime = now;
     }
 
+    static double QpcSeconds(const LARGE_INTEGER& from, const LARGE_INTEGER& to, const LARGE_INTEGER& frequency) {
+        return (double)(to.QuadPart - from.QuadPart) / (double)frequency.QuadPart;
+    }
+
+    // NVIDIA Reflex on the game's DirectX 11 device: settings follow the menu.
+    void ApplyReflexSettings() {
+        bool want = reflexEnabled;
+        bool boost = reflexBoost;
+        if (!_reflexApplied || want != _reflexOn || boost != _reflexBoostOn) {
+            if (reflex::SetMode(device11.get(), want, want && boost)) {
+                _reflexOn = want;
+                _reflexBoostOn = boost;
+                _reflexApplied = true;
+            }
+            else if (!_reflexApplied) {
+                _reflexApplied = true; // do not retry every frame
+                _reflexOn = false;
+            }
+        }
+    }
+
+    void ReflexMarker(reflex::NV_LATENCY_MARKER_TYPE type) {
+        if (_reflexOn) {
+            reflex::Marker(device11.get(), _reflexFrameId, type);
+        }
+    }
+
+    // At most 'framesAhead' frames may be waiting for the GPU when the game starts its next frame.
+    // 'submitted' is the fence value of the DirectX 12 work of the frame just handed over.
+    void LimitFramesAhead(uint64_t submitted) {
+        if (submitted == 0) {
+            return;
+        }
+        int ahead = framesAhead;
+        if (ahead < 0) {
+            ahead = 0;
+        }
+        if (ahead > 2) {
+            ahead = 2;
+        }
+        uint64_t waitFor = 0;
+        if (ahead == 0) {
+            waitFor = submitted;
+        }
+        else if (_submittedCount >= (uint64_t)ahead) {
+            waitFor = _submittedHistory[(_submittedCount - ahead) % kHistory];
+        }
+        _submittedHistory[_submittedCount % kHistory] = submitted;
+        _submittedCount++;
+        if (waitFor != 0) {
+            WaitForFence12(waitFor, 200);
+        }
+    }
+
+    void RecordFrameTime(double seconds) {
+        LARGE_INTEGER now;
+        QueryPerformanceCounter(&now);
+        float ms = (float)(seconds * 1000.0);
+        if (ms > _windowLongestMs) {
+            _windowLongestMs = ms;
+        }
+        if (_windowStart.QuadPart == 0) {
+            _windowStart = now;
+        }
+        if (QpcSeconds(_windowStart, now, _qpcFrequency) >= 2.0) {
+            statLongestFrameMs = _windowLongestMs;
+            _windowLongestMs = 0.0f;
+            _windowStart = now;
+        }
+        if (ms > 50.0f && QpcSeconds(_lastSlowLog, now, _qpcFrequency) > 1.0) {
+            _lastSlowLog = now;
+            Log(reshade::log::level::warning, "Slow frame: Present took %.1f ms (waiting for the presenter %.1f ms, frame limit %.1f ms, Reflex %.1f ms, generated=%d, reason: %s).",
+                ms, _lastSlotWaitMs, _lastLimitWaitMs, _lastReflexMs, _lastGenerated ? 1 : 0, statLastSkipReason.load());
+        }
+    }
+
     HRESULT PresentFrame(UINT syncInterval, UINT flags) {
         if (flags & DXGI_PRESENT_TEST) {
             return _real->Present(syncInterval, DXGI_PRESENT_TEST);
@@ -1045,6 +1153,15 @@ private:
         if (!_shared12 || _backBuffers12.empty()) {
             return DXGI_ERROR_INVALID_CALL;
         }
+        LARGE_INTEGER start;
+        QueryPerformanceCounter(&start);
+        _lastSlotWaitMs = 0.0;
+        _lastLimitWaitMs = 0.0;
+        _lastReflexMs = 0.0;
+        _lastGenerated = false;
+
+        ReflexMarker(reflex::RENDERSUBMIT_END);
+        ReflexMarker(reflex::PRESENT_START);
 
         // End of a frame rendered by the game: let the add-on do its per-frame work.
         if (onGameFrameEnd) {
@@ -1059,29 +1176,52 @@ private:
             _frameGenerationFailed = false;
         }
 
-        if (frameGenerationEnabled && inputs.valid && !_frameGenerationFailed) {
-            if (PresentWithFrameGeneration(syncInterval, flags, inputs)) {
-                return S_OK;
-            }
+        HRESULT hr = S_OK;
+        uint64_t submitted = 0;
+        bool throughPresenter = false;
+        if (frameGenerationEnabled && !_frameGenerationFailed) {
+            // Frames without Frame Generation data (menus, loading, videos) also go through the
+            // presenter, so its rhythm is not broken by switching back and forth.
+            throughPresenter = PresentThroughPresenter(syncInterval, flags, inputs, inputs.valid, submitted);
         }
         else if (!frameGenerationEnabled) {
             frameGenerationStatus = "off";
         }
-        else if (!inputs.valid && frameGenerationEnabled && !_frameGenerationFailed) {
-            frameGenerationStatus = "waiting for frame data (normal in menus, loading screens and videos)";
+        if (!throughPresenter) {
+            frameGenerationRunning = false;
+            _frameGenerationWasRunning = false;
+            DrainPresenter();
+            hr = PresentDirect(syncInterval, flags, submitted);
         }
 
-        frameGenerationRunning = false;
-        _frameGenerationWasRunning = false;
-        DrainPresenter();
-        return PresentDirect(syncInterval, flags);
+        ReflexMarker(reflex::PRESENT_END);
+
+        LARGE_INTEGER beforeLimit;
+        QueryPerformanceCounter(&beforeLimit);
+        LimitFramesAhead(submitted);
+        LARGE_INTEGER afterLimit;
+        QueryPerformanceCounter(&afterLimit);
+        _lastLimitWaitMs = QpcSeconds(beforeLimit, afterLimit, _qpcFrequency) * 1000.0;
+
+        // Start of the next frame (Reflex sleeps here when it is useful).
+        ApplyReflexSettings();
+        if (_reflexOn) {
+            reflex::Sleep(device11.get());
+            _reflexFrameId++;
+            ReflexMarker(reflex::SIMULATION_START);
+            ReflexMarker(reflex::RENDERSUBMIT_START);
+        }
+        LARGE_INTEGER end;
+        QueryPerformanceCounter(&end);
+        _lastReflexMs = QpcSeconds(afterLimit, end, _qpcFrequency) * 1000.0;
+        RecordFrameTime(QpcSeconds(start, end, _qpcFrequency));
+        return hr;
     }
 
     // Frame Generation off: copy the game's frame and present it right away.
-    HRESULT PresentDirect(UINT syncInterval, UINT flags) {
+    HRESULT PresentDirect(UINT syncInterval, UINT flags, uint64_t& copyDone) {
         uint64_t gameFrameDone = SignalFromD3D11();
         HRESULT hr;
-        uint64_t copyDone;
         {
             std::lock_guard<std::mutex> lock(queueMutex);
             queue12->Wait(fence11to12.get(), gameFrameDone);
@@ -1111,15 +1251,11 @@ private:
         return hr;
     }
 
-    // Frame Generation on: generate the in-between frame and hand both frames to the presenter.
-    // Returns false if this frame must be presented without Frame Generation.
-    bool PresentWithFrameGeneration(UINT syncInterval, UINT flags, const FrameInputs& inputs) {
+    // Frame Generation on: generate the in-between frame (when 'generate' and possible) and hand
+    // the frame(s) to the presenter thread. Returns false if this frame must be presented directly.
+    bool PresentThroughPresenter(UINT syncInterval, UINT flags, const FrameInputs& inputs, bool generate, uint64_t& submitted) {
         if (!InitNGX12()) {
             _frameGenerationFailed = true;
-            return false;
-        }
-        if (!depthShared.resource12 || !motionShared.resource12 ||
-            depthShared.width != inputs.renderWidth || depthShared.height != inputs.renderHeight) {
             return false;
         }
         if (!EnsureSlots()) {
@@ -1127,13 +1263,20 @@ private:
             _frameGenerationFailed = true;
             return false;
         }
+        if (generate && (!depthShared.resource12 || !motionShared.resource12 ||
+            depthShared.width != inputs.renderWidth || depthShared.height != inputs.renderHeight)) {
+            generate = false;
+        }
+        if (!generate) {
+            statLastSkipReason = "no frame data from the game this frame";
+            frameGenerationStatus = "waiting for frame data (normal in menus, loading screens and videos)";
+        }
 
         const uint32_t width = _gameDesc.BufferDesc.Width;
         const uint32_t height = _gameDesc.BufferDesc.Height;
         const DXGI_FORMAT format = _gameDesc.BufferDesc.Format;
-        bool recreate = fgHandle && (fgWidth != width || fgHeight != height || fgFormat != format ||
-            fgRenderWidth != inputs.renderWidth || fgRenderHeight != inputs.renderHeight);
-        if (recreate) {
+        if (generate && fgHandle && (fgWidth != width || fgHeight != height || fgFormat != format ||
+            fgRenderWidth != inputs.renderWidth || fgRenderHeight != inputs.renderHeight)) {
             DrainPresenter();
             ReleaseFrameGenerationFeature();
             _frameGenerationWasRunning = false;
@@ -1144,8 +1287,14 @@ private:
         _nextSlot = (_nextSlot + 1) % kSlots;
         Slot& slot = _slots[slotIndex];
         {
+            LARGE_INTEGER before;
+            QueryPerformanceCounter(&before);
             std::unique_lock<std::mutex> lock(_slotMutex);
-            if (!_slotCv.wait_for(lock, std::chrono::milliseconds(500), [&]() { return !slot.queued; })) {
+            bool free = _slotCv.wait_for(lock, std::chrono::milliseconds(500), [&]() { return !slot.queued; });
+            LARGE_INTEGER after;
+            QueryPerformanceCounter(&after);
+            _lastSlotWaitMs = QpcSeconds(before, after, _qpcFrequency) * 1000.0;
+            if (!free) {
                 Log(reshade::log::level::warning, "Presenter thread is stuck; presenting without Frame Generation.");
                 return false;
             }
@@ -1154,7 +1303,7 @@ private:
 
         uint64_t gameFrameDone = SignalFromD3D11();
         bool generated = false;
-        bool createdThisFrameOuter = false;
+        bool createdThisFrame = false;
         uint64_t workDone;
         {
             std::lock_guard<std::mutex> lock(queueMutex);
@@ -1163,8 +1312,7 @@ private:
             int ringIndex = BeginCommands(_renderRing);
             ID3D12GraphicsCommandList* list = _renderRing.list.get();
 
-            bool createdThisFrame = false;
-            if (!fgHandle) {
+            if (generate && !fgHandle) {
                 createdThisFrame = true;
                 NVSDK_NGX_DLSSG_Create_Params createParams = {};
                 createParams.Width = width;
@@ -1193,8 +1341,7 @@ private:
             ID3D12Resource* readInputs[] = { _shared12.get(), depthShared.resource12.get(), motionShared.resource12.get(),
                 inputs.hudlessValid ? hudlessShared.resource12.get() : nullptr };
             // On the frame the feature is created, only the real frame is shown.
-            createdThisFrameOuter = createdThisFrame;
-            bool evaluate = fgHandle && !createdThisFrame;
+            bool evaluate = generate && fgHandle && !createdThisFrame;
             if (evaluate) {
                 for (ID3D12Resource* resource : readInputs) {
                     if (resource) {
@@ -1258,17 +1405,27 @@ private:
         }
         // DirectX 11 may overwrite the back buffer, depth and motion vectors once DX12 read them.
         context11->Wait(fence12_11.get(), workDone);
+        submitted = workDone;
 
         if (generated) {
             frameGenerationRunning = true;
             frameGenerationStatus = "running (2x)";
+            statGenerated++;
         }
-        else if (fgHandle && !createdThisFrameOuter) {
-            frameGenerationStatus = "failed: DLSS Frame Generation evaluation failed";
-            Log(reshade::log::level::error, "DLSS Frame Generation evaluation failed; turning it off for this session.");
-            _frameGenerationFailed = true;
+        else {
+            statNotGenerated++;
+            if (generate && createdThisFrame) {
+                statLastSkipReason = "Frame Generation was (re)created this frame";
+            }
+            else if (generate && fgHandle) {
+                statLastSkipReason = "evaluation failed";
+                frameGenerationStatus = "failed: DLSS Frame Generation evaluation failed";
+                Log(reshade::log::level::error, "DLSS Frame Generation evaluation failed; turning it off for this session.");
+                _frameGenerationFailed = true;
+            }
         }
         _frameGenerationWasRunning = generated;
+        _lastGenerated = generated;
 
         {
             std::lock_guard<std::mutex> lock(_slotMutex);
@@ -1307,10 +1464,42 @@ private:
         return done;
     }
 
+    bool JobWaiting() {
+        std::lock_guard<std::mutex> lock(_jobMutex);
+        return _quit || !_jobs.empty();
+    }
+
+    // Waits until 'target' (QPC ticks) with ~1 ms precision, or until the game hands over a new frame.
+    void WaitUntil(const LARGE_INTEGER& target) {
+#ifndef CREATE_WAITABLE_TIMER_HIGH_RESOLUTION
+#define CREATE_WAITABLE_TIMER_HIGH_RESOLUTION 0x00000002
+#endif
+        thread_local HANDLE timer = CreateWaitableTimerExW(nullptr, nullptr, CREATE_WAITABLE_TIMER_HIGH_RESOLUTION, TIMER_ALL_ACCESS);
+        for (;;) {
+            if (JobWaiting()) {
+                return;
+            }
+            LARGE_INTEGER now;
+            QueryPerformanceCounter(&now);
+            double remaining = QpcSeconds(now, target, _qpcFrequency);
+            if (remaining <= 0.0) {
+                return;
+            }
+            if (remaining > 0.0015 && timer) {
+                double step = remaining - 0.0005 < 0.001 ? remaining - 0.0005 : 0.001;
+                LARGE_INTEGER due;
+                due.QuadPart = -(LONGLONG)(step * 10000000.0); // relative, 100 ns units
+                if (SetWaitableTimer(timer, &due, 0, nullptr, nullptr, FALSE)) {
+                    WaitForSingleObject(timer, 10);
+                    continue;
+                }
+            }
+            YieldProcessor();
+        }
+    }
+
     // Presenter thread: shows the generated frame, then the real frame half a frame later.
     void PresenterLoop() {
-        LARGE_INTEGER frequency;
-        QueryPerformanceFrequency(&frequency);
         for (;;) {
             Job job;
             {
@@ -1333,8 +1522,10 @@ private:
                     if (wait > 0.05) {
                         wait = 0.05;
                     }
-                    std::unique_lock<std::mutex> lock(_jobMutex);
-                    _jobCv.wait_for(lock, std::chrono::duration<double>(wait), [&]() { return _quit || !_jobs.empty(); });
+                    LARGE_INTEGER target;
+                    QueryPerformanceCounter(&target);
+                    target.QuadPart += (LONGLONG)(wait * (double)_qpcFrequency.QuadPart);
+                    WaitUntil(target);
                 }
             }
             uint64_t done = PresentTexture(slot.real.get(), job.syncInterval, job.flags);
@@ -1392,6 +1583,24 @@ private:
     double _frameInterval = 0.0;
     bool _frameGenerationWasRunning = false;
     bool _frameGenerationFailed = false;
+
+    // Latency
+    static constexpr int kHistory = 4;
+    uint64_t _submittedHistory[kHistory] = {};
+    uint64_t _submittedCount = 0;
+    bool _reflexApplied = false;
+    bool _reflexOn = false;
+    bool _reflexBoostOn = false;
+    uint64_t _reflexFrameId = 1;
+
+    // Statistics
+    LARGE_INTEGER _windowStart = {};
+    LARGE_INTEGER _lastSlowLog = {};
+    float _windowLongestMs = 0.0f;
+    double _lastSlotWaitMs = 0.0;
+    double _lastLimitWaitMs = 0.0;
+    double _lastReflexMs = 0.0;
+    bool _lastGenerated = false;
 };
 
 // Replaces IDXGIFactory::CreateSwapChain (vtable slot 10). Runs before ReShade's own hook.
