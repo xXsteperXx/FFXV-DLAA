@@ -18,8 +18,18 @@
 
 #include "intermediate/PrepareMotionVectors.h"
 #include "intermediate/0x0D1CD1AA.h"
+#include "frame_generation_bridge.hpp"
 
 using namespace reshade::api;
+
+// With the Frame Generation bridge, ReShade also reports DirectX 12 objects (the bridge's
+// own device and swap chain). Everything in this add-on except the bridge is DirectX 11 only.
+static bool IsD3D11(device* d) {
+    return d && d->get_api() == device_api::d3d11;
+}
+static bool IsD3D11(command_list* cmd_list) {
+    return cmd_list && IsD3D11(cmd_list->get_device());
+}
 
 NVSDK_NGX_Parameter* capabilityParameters = nullptr;
 NVSDK_NGX_Parameter* parameters = nullptr;
@@ -606,7 +616,7 @@ void OnPushDescriptors(command_list* cmd_list,
     pipeline_layout layout,
     uint32_t layout_param,
     const descriptor_table_update& update) {
-    if (!sceneMipBiasActive || settingOwnSamplers ||
+    if (!sceneMipBiasActive || settingOwnSamplers || !IsD3D11(cmd_list) ||
         update.type != descriptor_type::sampler || stages != shader_stage::pixel ||
         update.count == 0 || update.count > D3D11_COMMONSHADER_SAMPLER_SLOT_COUNT ||
         update.binding + update.count > D3D11_COMMONSHADER_SAMPLER_SLOT_COUNT) {
@@ -747,6 +757,18 @@ static void drawSettings(reshade::api::effect_runtime*)
     }
 
     ImGui::Separator();
+    ImGui::TextUnformatted("Frame Generation (in development)");
+    bool bridgeSetting = fg::bridgeRequested;
+    reshade::get_config_value(nullptr, "DLAA", "FrameGenerationBridge", bridgeSetting);
+    if (ImGui::Checkbox("Present through DirectX 12 (needed for Frame Generation, restart the game)", &bridgeSetting)) {
+        reshade::set_config_value(nullptr, "DLAA", "FrameGenerationBridge", bridgeSetting);
+    }
+    ImGui::Text("DirectX 12 bridge: %s", fg::bridgeStatus.load());
+    if (bridgeSetting != fg::bridgeRequested) {
+        ImGui::TextUnformatted("Restart the game to apply this change.");
+    }
+
+    ImGui::Separator();
     ImGui::TextUnformatted("Diagnostic (for development)");
     if (ImGui::Button("Record 1 frame to ReShade.log")) {
         diagRequested = true;
@@ -758,6 +780,9 @@ static void drawSettings(reshade::api::effect_runtime*)
 }
 
 void OnInitDevice(reshade::api::device* device) {
+    if (!IsD3D11(device)) {
+        return;
+    }
     reshade::get_config_value(nullptr, "DLAA", "SharpenAmount", sharpenMultiplier);
     if (sharpenMultiplier < 0.0f || sharpenMultiplier > 2.0f) {
         sharpenMultiplier = 1.0f;
@@ -774,6 +799,8 @@ void OnInitDevice(reshade::api::device* device) {
     }
     reshade::get_config_value(nullptr, "DLAA", "AutoExposure", autoExposure);
     reshade::get_config_value(nullptr, "DLAA", "SuperResolution", superResolutionEnabled);
+    reshade::get_config_value(nullptr, "DLAA", "FrameGenerationBridge", fg::bridgeRequested);
+    fg::InstallHook((ID3D11Device*)device->get_native());
     reshade::get_config_value(nullptr, "DLAA", "TextureDetail", mipBiasEnabled);
     reshade::get_config_value(nullptr, "DLAA", "TextureDetailAdjust", mipBiasEpsilon);
     if (!(mipBiasEpsilon >= -1.0f && mipBiasEpsilon <= 1.0f)) {
@@ -831,6 +858,9 @@ void OnInitDevice(reshade::api::device* device) {
 }
 
 void OnDestroyDevice(reshade::api::device* device) {
+    if (!IsD3D11(device)) {
+        return;
+    }
     Cleanup();
 }
 
@@ -840,6 +870,9 @@ bool OnCreatePipeline(
     uint32_t subobjectCount,
     const reshade::api::pipeline_subobject* subobjects) {
     bool replacedShader = false;
+    if (!IsD3D11(device)) {
+        return false;
+    }
 
     for (uint32_t i = 0; i < subobjectCount; ++i) {
         if (subobjects[i].type != reshade::api::pipeline_subobject_type::pixel_shader) {
@@ -864,6 +897,9 @@ void OnInitPipeline(device* device,
     uint32_t subobjectCount,
     const pipeline_subobject* subobjects,
     pipeline pipeline) {
+    if (!IsD3D11(device)) {
+        return;
+    }
     for (uint32_t i = 0; i < subobjectCount; ++i) {
         if (subobjects[i].type != reshade::api::pipeline_subobject_type::pixel_shader) {
             continue;
@@ -886,6 +922,9 @@ void OnInitPipeline(device* device,
 }
 
 void OnDestroyPipeline(reshade::api::device* device, reshade::api::pipeline pipeline) {
+    if (!IsD3D11(device)) {
+        return;
+    }
     {
         std::lock_guard<std::mutex> lock(diagMutex);
         pixelShaderHashes.erase(pipeline.handle);
@@ -974,6 +1013,9 @@ bool OnDraw(reshade::api::command_list* cmd_list,
     uint32_t instance_count,
     uint32_t first_vertex,
     uint32_t first_instance) {
+    if (!IsD3D11(cmd_list)) {
+        return false;
+    }
     ID3D11DeviceContext* deviceContext = (ID3D11DeviceContext*)(cmd_list->get_native());
     DiagOnGpuWork(deviceContext, false);
     com_ptr<ID3D11PixelShader> shader;
@@ -1172,7 +1214,7 @@ void OnMapBufferRegion(
     uint64_t size,
     map_access access,
     void** mapped_data) {
-    if (access != map_access::write_discard) {
+    if (access != map_access::write_discard || !IsD3D11(device)) {
         return;
     }
     D3D11_BUFFER_DESC bd;
@@ -1185,6 +1227,9 @@ void OnMapBufferRegion(
 void OnUnmapBufferRegion(
     device* device,
     resource resource) {
+    if (!IsD3D11(device)) {
+        return;
+    }
     if (mappedConstantBuffer) {
         jitter[0] = ((float*)mappedConstantBuffer)[8];
         jitter[1] = ((float*)mappedConstantBuffer)[9];
@@ -1198,6 +1243,10 @@ void OnPresent(command_queue* queue,
     const rect* dest_rect,
     uint32_t dirty_rect_count,
     const rect* dirty_rects) {
+    // Only once per frame rendered by the game (later, Frame Generation adds extra presents).
+    if (swapchain->get_device()->get_api() == device_api::d3d12 && !fg::inGameFramePresent) {
+        return;
+    }
     needReset = !invokedThisFrame;
     invokedThisFrame = false;
 
@@ -1247,6 +1296,9 @@ bool OnDrawIndexed(reshade::api::command_list* cmd_list,
     uint32_t first_index,
     int32_t vertex_offset,
     uint32_t first_instance) {
+    if (!IsD3D11(cmd_list)) {
+        return false;
+    }
     ID3D11DeviceContext* deviceContext = (ID3D11DeviceContext*)(cmd_list->get_native());
     DiagOnGpuWork(deviceContext, false);
     if (srPending) {
@@ -1263,6 +1315,9 @@ bool OnDispatch(reshade::api::command_list* cmd_list,
     uint32_t group_count_x,
     uint32_t group_count_y,
     uint32_t group_count_z) {
+    if (!IsD3D11(cmd_list)) {
+        return false;
+    }
     DiagOnGpuWork((ID3D11DeviceContext*)(cmd_list->get_native()), true);
     return false;
 }
@@ -1293,6 +1348,7 @@ BOOL APIENTRY DllMain(HMODULE hModule, DWORD fdwReason, LPVOID)
         reshade::register_event<reshade::addon_event::push_descriptors>(OnPushDescriptors);
 		break;
 	case DLL_PROCESS_DETACH:
+		fg::UninstallHook();
 		reshade::unregister_addon(hModule);
 		break;
 	}
