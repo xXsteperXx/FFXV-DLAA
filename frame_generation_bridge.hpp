@@ -50,6 +50,7 @@ inline std::atomic<bool> frameGenerationEnabled = false; // config [DLAA] FrameG
 inline std::atomic<const char*> frameGenerationStatus = "off";
 inline std::atomic<bool> frameGenerationRunning = false;
 inline std::atomic<bool> frameGenerationRetry = false;  // set by the menu when Frame Generation is switched on
+inline std::atomic<const char*> frameGenerationProblem = ""; // last problem preparing the inputs (kept until fixed)
 inline std::atomic<uint32_t> multiFrameCountMax = 0;    // reported by the driver (1 = only 2x)
 inline std::atomic<bool> transposeMatrices = true;      // debug: matrix layout handed to DLSS-FG
 inline std::atomic<int> depthInvertedMode = -1;         // debug: -1 automatic, 0 no, 1 yes
@@ -321,25 +322,56 @@ struct SharedTexture {
     bool Matches(uint32_t w, uint32_t h, DXGI_FORMAT f) const {
         return texture11 && resource12 && width == w && height == h && format == f;
     }
-    bool Create(uint32_t w, uint32_t h, DXGI_FORMAT f, D3D12_RESOURCE_FLAGS flags) {
-        Reset();
-        if (!CreateTexture12(w, h, f, flags | D3D12_RESOURCE_FLAG_ALLOW_SIMULTANEOUS_ACCESS, D3D12_HEAP_FLAG_SHARED, D3D12_RESOURCE_STATE_COMMON, resource12)) {
-            return false;
+    bool Create(const char* name, uint32_t w, uint32_t h, DXGI_FORMAT f, D3D12_RESOURCE_FLAGS flags) {
+        // First the same way as the shared back buffer (known to work), then without
+        // simultaneous access as a fallback.
+        if (TryCreate(name, w, h, f, flags | D3D12_RESOURCE_FLAG_ALLOW_SIMULTANEOUS_ACCESS)) {
+            return true;
         }
-        HANDLE sharedHandle = nullptr;
-        if (FAILED(device12->CreateSharedHandle(resource12.get(), nullptr, GENERIC_ALL, nullptr, &sharedHandle))) {
+        return TryCreate(name, w, h, f, flags);
+    }
+
+private:
+    bool TryCreate(const char* name, uint32_t w, uint32_t h, DXGI_FORMAT f, D3D12_RESOURCE_FLAGS flags) {
+        Reset();
+        D3D12_HEAP_PROPERTIES heap = {};
+        heap.Type = D3D12_HEAP_TYPE_DEFAULT;
+        D3D12_RESOURCE_DESC desc = {};
+        desc.Dimension = D3D12_RESOURCE_DIMENSION_TEXTURE2D;
+        desc.Width = w;
+        desc.Height = h;
+        desc.DepthOrArraySize = 1;
+        desc.MipLevels = 1;
+        desc.Format = f;
+        desc.SampleDesc.Count = 1;
+        desc.Layout = D3D12_TEXTURE_LAYOUT_UNKNOWN;
+        desc.Flags = flags;
+        HRESULT hr = device12->CreateCommittedResource(&heap, D3D12_HEAP_FLAG_SHARED, &desc, D3D12_RESOURCE_STATE_COMMON, nullptr,
+            __uuidof(ID3D12Resource), (void**)&resource12);
+        if (FAILED(hr) || !resource12) {
+            Log(reshade::log::level::warning, "Shared texture '%s' (%ux%u format %u flags 0x%X): DirectX 12 creation failed (0x%08X).",
+                name, w, h, (unsigned)f, (unsigned)flags, (unsigned)hr);
             Reset();
             return false;
         }
-        HRESULT hr = device11_5->OpenSharedResource1(sharedHandle, __uuidof(ID3D11Texture2D), (void**)&texture11);
+        HANDLE sharedHandle = nullptr;
+        hr = device12->CreateSharedHandle(resource12.get(), nullptr, GENERIC_ALL, nullptr, &sharedHandle);
+        if (FAILED(hr)) {
+            Log(reshade::log::level::warning, "Shared texture '%s': CreateSharedHandle failed (0x%08X).", name, (unsigned)hr);
+            Reset();
+            return false;
+        }
+        hr = device11_5->OpenSharedResource1(sharedHandle, __uuidof(ID3D11Texture2D), (void**)&texture11);
         CloseHandle(sharedHandle);
         if (FAILED(hr) || !texture11) {
+            Log(reshade::log::level::warning, "Shared texture '%s' (flags 0x%X): DirectX 11 could not open it (0x%08X).", name, (unsigned)flags, (unsigned)hr);
             Reset();
             return false;
         }
         width = w;
         height = h;
         format = f;
+        Log(reshade::log::level::info, "Shared texture '%s' created (%ux%u format %u flags 0x%X).", name, w, h, (unsigned)f, (unsigned)flags);
         return true;
     }
 };
@@ -362,23 +394,40 @@ inline bool EnsureFrameInputs(uint32_t renderWidth, uint32_t renderHeight) {
         motionShared.Matches(renderWidth, renderHeight, DXGI_FORMAT_R16G16_FLOAT) && depthUAV11) {
         return true;
     }
+    // Do not retry every frame after a failure (it would flush the GPU each time).
+    static uint32_t failedWidth = 0;
+    static uint32_t failedHeight = 0;
+    if (failedWidth == renderWidth && failedHeight == renderHeight) {
+        return false;
+    }
     FlushGpu(); // the previous textures may still be read by DirectX 12
     depthUAV11.reset();
-    if (!depthShared.Create(renderWidth, renderHeight, DXGI_FORMAT_R32_FLOAT, D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS) ||
-        !motionShared.Create(renderWidth, renderHeight, DXGI_FORMAT_R16G16_FLOAT, D3D12_RESOURCE_FLAG_NONE)) {
+    const D3D12_RESOURCE_FLAGS flags = D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET | D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS;
+    if (!depthShared.Create("depth", renderWidth, renderHeight, DXGI_FORMAT_R32_FLOAT, flags) ||
+        !motionShared.Create("motion vectors", renderWidth, renderHeight, DXGI_FORMAT_R16G16_FLOAT, flags)) {
         depthShared.Reset();
         motionShared.Reset();
-        frameGenerationStatus = "failed: could not share depth/motion vectors";
+        failedWidth = renderWidth;
+        failedHeight = renderHeight;
+        frameGenerationProblem = "could not share the depth/motion vectors with DirectX 12 (see ReShade.log)";
         return false;
     }
     D3D11_UNORDERED_ACCESS_VIEW_DESC uavDesc = {};
     uavDesc.Format = DXGI_FORMAT_R32_FLOAT;
     uavDesc.ViewDimension = D3D11_UAV_DIMENSION_TEXTURE2D;
-    if (FAILED(device11->CreateUnorderedAccessView(depthShared.texture11.get(), &uavDesc, &depthUAV11))) {
+    HRESULT hr = device11->CreateUnorderedAccessView(depthShared.texture11.get(), &uavDesc, &depthUAV11);
+    if (FAILED(hr)) {
+        Log(reshade::log::level::warning, "Could not create the DirectX 11 view of the shared depth (0x%08X).", (unsigned)hr);
         depthShared.Reset();
         motionShared.Reset();
+        failedWidth = renderWidth;
+        failedHeight = renderHeight;
+        frameGenerationProblem = "could not write the depth for DirectX 12 (see ReShade.log)";
         return false;
     }
+    failedWidth = 0;
+    failedHeight = 0;
+    frameGenerationProblem = "";
     return true;
 }
 
@@ -387,13 +436,24 @@ inline bool EnsureHudless(uint32_t width, uint32_t height, DXGI_FORMAT format) {
     if (hudlessShared.Matches(width, height, format) && hudlessRTV11) {
         return true;
     }
-    FlushGpu();
-    hudlessRTV11.reset();
-    if (!hudlessShared.Create(width, height, format, D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET)) {
+    static uint32_t failedWidth = 0;
+    static uint32_t failedHeight = 0;
+    if (failedWidth == width && failedHeight == height) {
         return false;
     }
-    if (FAILED(device11->CreateRenderTargetView(hudlessShared.texture11.get(), nullptr, &hudlessRTV11))) {
+    FlushGpu();
+    hudlessRTV11.reset();
+    if (!hudlessShared.Create("image without HUD", width, height, format, D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET)) {
+        failedWidth = width;
+        failedHeight = height;
+        return false;
+    }
+    HRESULT hr = device11->CreateRenderTargetView(hudlessShared.texture11.get(), nullptr, &hudlessRTV11);
+    if (FAILED(hr)) {
+        Log(reshade::log::level::warning, "Could not create the DirectX 11 view of the image without HUD (0x%08X).", (unsigned)hr);
         hudlessShared.Reset();
+        failedWidth = width;
+        failedHeight = height;
         return false;
     }
     return true;
@@ -1008,7 +1068,7 @@ private:
             frameGenerationStatus = "off";
         }
         else if (!inputs.valid && frameGenerationEnabled && !_frameGenerationFailed) {
-            frameGenerationStatus = "waiting (no 3D scene this frame: menu, loading or video)";
+            frameGenerationStatus = "waiting for frame data (normal in menus, loading screens and videos)";
         }
 
         frameGenerationRunning = false;
