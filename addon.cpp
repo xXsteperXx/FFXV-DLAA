@@ -14,6 +14,7 @@
 #include <cstdio>
 #include <cstring>
 #include <string>
+#include <cmath>
 
 #include "intermediate/PrepareMotionVectors.h"
 #include "intermediate/0x0D1CD1AA.h"
@@ -69,17 +70,47 @@ std::atomic<bool> diagCapturing = false;
 uint32_t diagPassIndex = 0;
 uint64_t diagBackBuffer = 0;
 
-// CPU copy of the TAA constant buffer (cbTemporalAA), taken when the game
-// unmaps it. Lets us read the exact jitter/screen size the TAA pass used.
-std::mutex taaShadowMutex;
-std::atomic<ID3D11Buffer*> taaConstantBuffer = nullptr; // identity only
-void* taaConstantBufferMapped = nullptr; // guarded by taaShadowMutex
-float taaConstantBufferShadow[64] = {}; // guarded by taaShadowMutex
-bool taaConstantBufferShadowValid = false; // guarded by taaShadowMutex
-ID3D11Buffer* taaConstantBufferShadowSource = nullptr; // guarded by taaShadowMutex, identity only
+HMODULE addonModule = nullptr;
+FILE* diagFile = nullptr;
+bool diagFileStartedThisSession = false;
+
+// Diagnostic lines go to their own file (FFXV-DLAA-diag.log, next to the add-on),
+// not to ReShade.log. The file is restarted once per game session; every recorded
+// frame of the same session is appended to it.
+static std::wstring DiagFilePath() {
+    wchar_t modulePath[MAX_PATH] = {};
+    GetModuleFileNameW(addonModule, modulePath, MAX_PATH);
+    std::wstring path = modulePath;
+    size_t slash = path.find_last_of(L"\\/");
+    path = (slash == std::wstring::npos) ? L"" : path.substr(0, slash + 1);
+    return path + L"FFXV-DLAA-diag.log";
+}
+
+static void DiagOpenFile() {
+    if (diagFile) {
+        return;
+    }
+    if (_wfopen_s(&diagFile, DiagFilePath().c_str(), diagFileStartedThisSession ? L"a" : L"w") != 0) {
+        diagFile = nullptr;
+    }
+    diagFileStartedThisSession = true;
+}
+
+static void DiagCloseFile() {
+    if (diagFile) {
+        fclose(diagFile);
+        diagFile = nullptr;
+    }
+}
 
 static void DiagLog(const std::string& text) {
-    reshade::log::message(reshade::log::level::info, text.c_str());
+    if (diagFile) {
+        fputs(text.c_str(), diagFile);
+        fputc('\n', diagFile);
+    }
+    else {
+        reshade::log::message(reshade::log::level::info, text.c_str());
+    }
 }
 
 // Caller must hold diagMutex.
@@ -268,26 +299,15 @@ static void DiagOnGpuWork(ID3D11DeviceContext* ctx, bool isDispatch) {
     }
 }
 
-// Called from the TAA branch of OnDraw with the constant buffer bound to the TAA pass.
-static void DiagOnTAA(ID3D11Buffer* cbTemporalAA, uint32_t rtWidth, uint32_t rtHeight) {
+// Called from the TAA branch of OnDraw.
+static void DiagOnTAA(uint32_t rtWidth, uint32_t rtHeight) {
     if (!diagCapturing) {
         return;
     }
-    char buffer[400];
-    std::lock_guard<std::mutex> lock(taaShadowMutex);
-    if (taaConstantBufferShadowValid && taaConstantBufferShadowSource == cbTemporalAA) {
-        const float* c = taaConstantBufferShadow;
-        snprintf(buffer, sizeof(buffer),
-            "[DLAA-DIAG]      TAA constants: screenSize=%.1f,%.1f,%.6f,%.6f frameBits=%.3f,%.3f,%.3f,%.3f "
-            "jitterUV=%.6f,%.6f,%.6f,%.6f | jitter used by mod=%.6f,%.6f | taa target=%ux%u",
-            c[0], c[1], c[2], c[3], c[4], c[5], c[6], c[7], c[8], c[9], c[10], c[11],
-            jitter[0], jitter[1], rtWidth, rtHeight);
-    }
-    else {
-        snprintf(buffer, sizeof(buffer),
-            "[DLAA-DIAG]      TAA constants: not captured (buffer changed or not mapped yet) | jitter used by mod=%.6f,%.6f | taa target=%ux%u",
-            jitter[0], jitter[1], rtWidth, rtHeight);
-    }
+    char buffer[200];
+    snprintf(buffer, sizeof(buffer),
+        "[DLAA-DIAG]      TAA: render size=%ux%u jitter=%.6f,%.6f (pixels %.3f,%.3f)",
+        rtWidth, rtHeight, jitter[0], jitter[1], jitter[0] * rtWidth, jitter[1] * rtHeight);
     DiagLog(buffer);
 }
 
@@ -298,6 +318,8 @@ static void DiagOnPresent(swapchain* swapchain) {
             DiagFlushPass(entry.second);
         }
         DiagLog("[DLAA-DIAG] ===== END OF FRAME =====");
+        DiagCloseFile();
+        reshade::log::message(reshade::log::level::info, "Diagnostic frame recorded to FFXV-DLAA-diag.log");
         diagCapturing = false;
         diagPasses.clear();
         diagIds.clear();
@@ -308,6 +330,7 @@ static void DiagOnPresent(swapchain* swapchain) {
         diagPasses.clear();
         diagIds.clear();
         diagBackBuffer = swapchain->get_current_back_buffer().handle;
+        DiagOpenFile();
         std::string backBufferText = DiagTex((ID3D11Resource*)diagBackBuffer);
         char buffer[160];
         snprintf(buffer, sizeof(buffer), " dlss=%s", dlssAvailable ? "available" : "NOT available");
@@ -518,6 +541,95 @@ static bool EnsureSuperResolution(ID3D11DeviceContext* context, uint32_t inW, ui
     return true;
 }
 
+// ---------------------------------------------------------------------------
+// Texture detail in Super Resolution (mip-map bias).
+//
+// At a reduced render resolution the GPU picks smaller texture mip levels, so
+// textures look like the reduced resolution even after DLSS. The DLSS
+// Programming Guide (section 3.5) requires a negative mip bias when DLSS is on:
+//     bias = log2(render width / output width) - 1.0 + epsilon
+// e.g. -2.0 at 50%, -1.415 at 75%. The game creates its samplers with its own
+// bias, so while the 3D scene is drawn (from the start of the frame until the
+// TAA pass) every pixel-shader sampler the game binds is swapped for a copy with
+// the extra bias. Comparison samplers (shadows) are never touched.
+// ---------------------------------------------------------------------------
+bool mipBiasEnabled = true;
+float mipBiasEpsilon = 0.0f;       // user adjustment: + = softer/stabler, - = sharper
+std::atomic<float> activeMipBias = 0.0f; // shown in the menu
+bool sceneMipBiasActive = false;   // true while the 3D scene of a Super Resolution frame is drawn
+float cachedMipBias = 0.0f;        // bias the cached samplers were made with
+std::unordered_map<std::string, com_ptr<ID3D11SamplerState>> biasedSamplers; // key: original desc bytes
+std::set<ID3D11SamplerState*> ownBiasedSamplers; // identity only
+thread_local bool settingOwnSamplers = false;
+
+static void ReleaseBiasedSamplers() {
+    biasedSamplers.clear();
+    ownBiasedSamplers.clear();
+}
+
+static ID3D11SamplerState* GetBiasedSampler(ID3D11SamplerState* original) {
+    if (!original || ownBiasedSamplers.count(original)) {
+        return nullptr;
+    }
+    D3D11_SAMPLER_DESC desc;
+    original->GetDesc(&desc);
+    // Comparison (shadow) and min/max reduction samplers keep their original bias,
+    // and samplers that never use mip levels are left alone.
+    if ((unsigned)desc.Filter >= 0x80 || desc.MaxLOD <= 0.0f) {
+        return nullptr;
+    }
+
+    std::string key((const char*)&desc, sizeof(desc));
+    auto it = biasedSamplers.find(key);
+    if (it != biasedSamplers.end()) {
+        return it->second.get();
+    }
+
+    D3D11_SAMPLER_DESC biasedDesc = desc;
+    float bias = desc.MipLODBias + cachedMipBias;
+    biasedDesc.MipLODBias = bias < -16.0f ? -16.0f : (bias > 15.99f ? 15.99f : bias);
+
+    com_ptr<ID3D11Device> device;
+    original->GetDevice(&device);
+    com_ptr<ID3D11SamplerState> biased;
+    if (!device || FAILED(device->CreateSamplerState(&biasedDesc, &biased)) || !biased) {
+        return nullptr;
+    }
+    ownBiasedSamplers.insert(biased.get());
+    biasedSamplers[key] = biased;
+    return biased.get();
+}
+
+// Called after the game binds pixel-shader samplers (ReShade has already applied the game's call).
+void OnPushDescriptors(command_list* cmd_list,
+    shader_stage stages,
+    pipeline_layout layout,
+    uint32_t layout_param,
+    const descriptor_table_update& update) {
+    if (!sceneMipBiasActive || settingOwnSamplers ||
+        update.type != descriptor_type::sampler || stages != shader_stage::pixel ||
+        update.count == 0 || update.count > D3D11_COMMONSHADER_SAMPLER_SLOT_COUNT ||
+        update.binding + update.count > D3D11_COMMONSHADER_SAMPLER_SLOT_COUNT) {
+        return;
+    }
+
+    ID3D11SamplerState* samplers[D3D11_COMMONSHADER_SAMPLER_SLOT_COUNT];
+    const sampler* descriptors = (const sampler*)update.descriptors;
+    bool changed = false;
+    for (uint32_t i = 0; i < update.count; ++i) {
+        samplers[i] = (ID3D11SamplerState*)descriptors[i].handle;
+        if (ID3D11SamplerState* biased = GetBiasedSampler(samplers[i])) {
+            samplers[i] = biased;
+            changed = true;
+        }
+    }
+    if (changed) {
+        settingOwnSamplers = true;
+        ((ID3D11DeviceContext*)cmd_list->get_native())->PSSetSamplers(update.binding, update.count, samplers);
+        settingOwnSamplers = false;
+    }
+}
+
 // Gives up on Super Resolution for a while (DLAA is used meanwhile).
 static void PauseSuperResolution(const char* reason) {
     srRetryCooldown = 600;
@@ -531,6 +643,8 @@ void Cleanup() {
     ReleaseDLSS();
     ReleaseSuperResolution();
     ReleaseMotionVectors();
+    ReleaseBiasedSamplers();
+    sceneMipBiasActive = false;
     srDepth.reset();
 
     prepareMotionVectorShader.reset();
@@ -609,6 +723,18 @@ static void drawSettings(reshade::api::effect_runtime*)
         reshade::set_config_value(nullptr, "DLAA", "SuperResolution", superResolutionEnabled);
         srRetryCooldown = 0;
     }
+    if (ImGui::Checkbox("Full texture detail in Super Resolution (mip bias)", &mipBiasEnabled))
+    {
+        reshade::set_config_value(nullptr, "DLAA", "TextureDetail", mipBiasEnabled);
+    }
+    if (mipBiasEnabled) {
+        if (ImGui::SliderFloat("Texture detail adjust (+ softer, - sharper)", &mipBiasEpsilon, -1.0f, 1.0f, "%.2f")) {
+            reshade::set_config_value(nullptr, "DLAA", "TextureDetailAdjust", mipBiasEpsilon);
+        }
+        if (activeMipBias.load() != 0.0f) {
+            ImGui::Text("Texture mip bias in use: %.2f", activeMipBias.load());
+        }
+    }
     if (statusInWidth > 0) {
         ImGui::Text("Status: %s (%ux%u -> %ux%u)", dlssStatus.load(),
             statusInWidth.load(), statusInHeight.load(), statusOutWidth.load(), statusOutHeight.load());
@@ -648,6 +774,11 @@ void OnInitDevice(reshade::api::device* device) {
     }
     reshade::get_config_value(nullptr, "DLAA", "AutoExposure", autoExposure);
     reshade::get_config_value(nullptr, "DLAA", "SuperResolution", superResolutionEnabled);
+    reshade::get_config_value(nullptr, "DLAA", "TextureDetail", mipBiasEnabled);
+    reshade::get_config_value(nullptr, "DLAA", "TextureDetailAdjust", mipBiasEpsilon);
+    if (!(mipBiasEpsilon >= -1.0f && mipBiasEpsilon <= 1.0f)) {
+        mipBiasEpsilon = 0.0f;
+    }
 
     NVSDK_NGX_Result result = NVSDK_NGX_D3D11_Init(1,
         L"",
@@ -849,6 +980,15 @@ bool OnDraw(reshade::api::command_list* cmd_list,
     deviceContext->PSGetShader(&shader, nullptr, nullptr);
 
     if (dlssAvailable && taaShaders.find(shader.get()) != taaShaders.end()) {
+        // The 3D scene is finished: stop adding texture mip bias for the rest of the frame.
+        if (diagCapturing) {
+            char note[160];
+            snprintf(note, sizeof(note), "Texture mip bias during the 3D scene: %s, bias=%.2f, biased sampler copies=%zu",
+                sceneMipBiasActive ? "on" : "off", cachedMipBias, biasedSamplers.size());
+            DiagNote(note);
+        }
+        sceneMipBiasActive = false;
+
         com_ptr<ID3D11RenderTargetView> renderTargetView;
         deviceContext->OMGetRenderTargets(1, &renderTargetView, nullptr);
 
@@ -885,8 +1025,7 @@ bool OnDraw(reshade::api::command_list* cmd_list,
 
         com_ptr<ID3D11Buffer> cbTemporalAA;
         deviceContext->PSGetConstantBuffers(0, 1, &cbTemporalAA);
-        taaConstantBuffer = cbTemporalAA.get();
-        DiagOnTAA(cbTemporalAA.get(), width, height);
+        DiagOnTAA(width, height);
 
         com_ptr<ID3D11ShaderResourceView> inColorSRV;
         deviceContext->PSGetShaderResources(0, 1, &inColorSRV);
@@ -1041,27 +1180,11 @@ void OnMapBufferRegion(
     if (bd.ByteWidth == 256) {
         mappedConstantBuffer = *mapped_data;
     }
-    if ((ID3D11Buffer*)resource.handle == taaConstantBuffer.load() && mapped_data && *mapped_data) {
-        std::lock_guard<std::mutex> lock(taaShadowMutex);
-        taaConstantBufferMapped = *mapped_data;
-    }
 }
 
 void OnUnmapBufferRegion(
     device* device,
     resource resource) {
-    if ((ID3D11Buffer*)resource.handle == taaConstantBuffer.load()) {
-        std::lock_guard<std::mutex> lock(taaShadowMutex);
-        if (taaConstantBufferMapped) {
-            D3D11_BUFFER_DESC bd;
-            ((ID3D11Buffer*)resource.handle)->GetDesc(&bd);
-            size_t bytes = bd.ByteWidth < sizeof(taaConstantBufferShadow) ? bd.ByteWidth : sizeof(taaConstantBufferShadow);
-            memcpy(taaConstantBufferShadow, taaConstantBufferMapped, bytes);
-            taaConstantBufferShadowValid = true;
-            taaConstantBufferShadowSource = (ID3D11Buffer*)resource.handle;
-            taaConstantBufferMapped = nullptr;
-        }
-    }
     if (mappedConstantBuffer) {
         jitter[0] = ((float*)mappedConstantBuffer)[8];
         jitter[1] = ((float*)mappedConstantBuffer)[9];
@@ -1084,6 +1207,22 @@ void OnPresent(command_queue* queue,
         PauseSuperResolution("Super Resolution: stretch pass not found in this scene, using DLAA");
     }
     srNeedReset = !srEvaluatedThisFrame;
+
+    // Texture detail for the next frame's 3D scene (only while Super Resolution is running).
+    if (mipBiasEnabled && srEvaluatedThisFrame && srRenderWidth > 0 && srOutWidth > 0) {
+        float bias = log2f((float)srRenderWidth / (float)srOutWidth) - 1.0f + mipBiasEpsilon;
+        if (fabsf(bias - cachedMipBias) > 0.001f) {
+            ReleaseBiasedSamplers();
+            cachedMipBias = bias;
+        }
+        activeMipBias = bias;
+        sceneMipBiasActive = true;
+    }
+    else {
+        activeMipBias = 0.0f;
+        sceneMipBiasActive = false;
+    }
+
     srPending = false;
     srEvaluatedThisFrame = false;
     srDepth.reset();
@@ -1136,6 +1275,7 @@ BOOL APIENTRY DllMain(HMODULE hModule, DWORD fdwReason, LPVOID)
 	switch (fdwReason)
 	{
 	case DLL_PROCESS_ATTACH:
+        addonModule = hModule;
 		if (!reshade::register_addon(hModule))
 			return FALSE;
         reshade::register_overlay(nullptr, drawSettings);
@@ -1150,6 +1290,7 @@ BOOL APIENTRY DllMain(HMODULE hModule, DWORD fdwReason, LPVOID)
         reshade::register_event<reshade::addon_event::present>(OnPresent);
         reshade::register_event<reshade::addon_event::draw_indexed>(OnDrawIndexed);
         reshade::register_event<reshade::addon_event::dispatch>(OnDispatch);
+        reshade::register_event<reshade::addon_event::push_descriptors>(OnPushDescriptors);
 		break;
 	case DLL_PROCESS_DETACH:
 		reshade::unregister_addon(hModule);
