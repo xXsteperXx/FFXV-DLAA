@@ -15,6 +15,8 @@ cbuffer cbTemporalAA : register(b0)
 Texture2D<float2> g_velocityTex : register(t0);
 Texture2D<float> g_depthTex : register(t1);
 RWTexture2D<float2> g_updatedVelocityTex : register(u0);
+// Copy of the depth for Frame Generation (DirectX 12 side). Unbound when Frame Generation is off.
+RWTexture2D<float> g_depthCopyTex : register(u1);
 
 [numthreads(8, 8, 1)]
 void main(uint2 tid : SV_DispatchThreadID, uint3 gid : SV_GroupId, uint gix : SV_GroupIndex)
@@ -23,14 +25,15 @@ void main(uint2 tid : SV_DispatchThreadID, uint3 gid : SV_GroupId, uint gix : SV
 	{
 		return;
 	}
+	float depth = g_depthTex[tid];
 	float2 velocity = g_velocityTex[tid].xy;
 	if(velocity.y == 1.0f)
 	{
 		float2 texCoord = float2(tid) / g_screenSize.xy;
-		float depth = g_depthTex[tid];
 		float4 prevTS = mul(g_motionMatrix, float4(texCoord, depth, 1.0f));
 		prevTS /= prevTS.w;
 		velocity = prevTS.xy - texCoord;
 	}
 	g_updatedVelocityTex[tid] = velocity * g_screenSize.xy;
+	g_depthCopyTex[tid] = depth;
 }
