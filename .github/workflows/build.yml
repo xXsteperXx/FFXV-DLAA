@@ -1,8 +1,7 @@
 name: Build
 
+# Só compila quando você clicar em "Run workflow" na aba Actions.
 on:
-  push:
-  pull_request:
   workflow_dispatch:
 
 jobs:
@@ -13,18 +12,18 @@ jobs:
       # Baixa o código do repositório e os submódulos (reshade + DLSS),
       # incluindo o submódulo interno do ReShade (deps/imgui).
       - name: Baixar o código com os submódulos
-        uses: actions/checkout@v4
+        uses: actions/checkout@v6
         with:
           submodules: recursive
 
       # O pré-build do projeto roda "python.exe embedfile.py".
       - name: Instalar Python
-        uses: actions/setup-python@v5
+        uses: actions/setup-python@v6
         with:
           python-version: '3.12'
 
       - name: Preparar o MSBuild
-        uses: microsoft/setup-msbuild@v2
+        uses: microsoft/setup-msbuild@v3
 
       # O pré-build do projeto roda "fxc" (compilador de shaders do Windows SDK).
       - name: Colocar o fxc.exe no PATH
@@ -75,7 +74,7 @@ jobs:
           Copy-Item DLSS/lib/Windows_x86_64/rel/nvngx_dlssg.dll package/
 
       - name: Disponibilizar os arquivos para download
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v6
         with:
           name: DLAA-Inject
           path: package/
