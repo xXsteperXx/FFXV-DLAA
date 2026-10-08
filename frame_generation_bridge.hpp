@@ -14,12 +14,26 @@
 // With Frame Generation, the add-on (DirectX 11 side) also shares the depth,
 // the motion vectors, the image without HUD and the camera of each frame;
 // DLSS-FG then creates the in-between frame, and a separate thread presents the
-// generated frame followed by the real frame half a frame later (pacing).
+// generated frame and then the real frame.
 //
-// Synchronization uses two shared fences:
-//   fence11to12: signaled by DirectX 11 when a frame is finished, waited by DX12
-//   fence12:     signaled by DirectX 12 when it is done reading/copying,
-//                waited by DirectX 11 (before it overwrites shared textures) and the CPU
+// Two DirectX 12 queues:
+//   queue12:        Frame Generation work, submitted by the game's render thread
+//   presentQueue12: the swap chain's queue (copies into the back buffer + presents)
+// so a frame that waits to be shown never waits behind the next frame's work.
+//
+// Pacing (same idea as AMD's open-source FSR 3 frame interpolation swap chain):
+// a watcher thread notes when the GPU really finished each frame; the presenter
+// thread uses the time between finished frames to show the generated frame and
+// then the real frame half a frame later.
+//
+// Input lag: LatencyFleX (open-source alternative to NVIDIA Reflex, latencyflex.h)
+// delays the start of the game's next frame so that frames do not queue up.
+//
+// Synchronization uses three shared fences:
+//   fence11to12:    signaled by DirectX 11 when a frame is finished, waited by DX12
+//   fence12:        signaled by queue12 when it is done reading the game's textures
+//   presentFence12: signaled by presentQueue12 after its copies
+// DirectX 11 waits on the last two before it overwrites shared textures.
 //
 // Must be included after <reshade.hpp>, <com_ptr.hpp>, <d3d11.h> and the NGX headers.
 // ---------------------------------------------------------------------------
@@ -27,7 +41,13 @@
 #include <d3d12.h>
 #include <dxgi1_6.h>
 #include <nvsdk_ngx_helpers_dlssg.h>
-#include "reflex.hpp"
+#pragma push_macro("min")
+#pragma push_macro("max")
+#undef min
+#undef max
+#include "latencyflex.h"
+#pragma pop_macro("max")
+#pragma pop_macro("min")
 #include <atomic>
 #include <cmath>
 #include <condition_variable>
@@ -54,10 +74,9 @@ inline std::atomic<bool> frameGenerationRetry = false;  // set by the menu when 
 inline std::atomic<const char*> frameGenerationProblem = ""; // last problem preparing the inputs (kept until fixed)
 
 // Latency settings (menu)
-inline std::atomic<bool> reflexEnabled = false;  // NVIDIA Reflex on the game's device (Community Shaders disables it with a DX12 bridge too)
-inline std::atomic<bool> reflexBoost = false;    // Reflex boost (GPU clocks kept high)
-inline std::atomic<int> framesAhead = 1;         // frames the game may prepare ahead of the GPU (0..2)
-inline std::atomic<int> displayQueue = 1;        // frames DXGI may queue for the display (1..3), like Community Shaders' waitable
+enum LatencyMode { kLatencyOff = 0, kLatencyBasic = 1, kLatencyAutomatic = 2 };
+inline std::atomic<int> latencyMode = kLatencyAutomatic; // config [DLAA] LatencyMode
+inline std::atomic<int> displayQueue = 1;        // frames DXGI may queue for the display (1..3), only used with V-Sync
 
 // Display information (menu)
 inline std::atomic<uint32_t> infoSyncInterval = 0;   // V-Sync requested by the game (0 = off)
@@ -70,6 +89,11 @@ inline std::atomic<uint64_t> statNotGenerated = 0;  // frames presented without 
 inline std::atomic<uint64_t> statCameraReused = 0;  // frames that reused the previous camera
 inline std::atomic<float> statLongestFrameMs = 0.0f; // longest time spent in Present (last ~2 s)
 inline std::atomic<const char*> statLastSkipReason = "-";
+inline std::atomic<float> statFrameTimeMs = 0.0f;    // time between frames finished by the GPU (game's own frame rate)
+inline std::atomic<float> statFrameJitterMs = 0.0f;  // how much that time varies
+inline std::atomic<float> statLatencyMs = 0.0f;      // start of a game frame -> GPU finished it (LatencyFleX estimate)
+inline std::atomic<float> statLatencySleepMs = 0.0f; // average wait added at the start of each frame
+inline std::atomic<uint64_t> statLateFrames = 0;     // real frames shown early because the next frame was already done
 inline std::atomic<uint32_t> multiFrameCountMax = 0;    // reported by the driver (1 = only 2x)
 inline std::atomic<bool> transposeMatrices = true;      // debug: matrix layout handed to DLSS-FG
 inline std::atomic<int> depthInvertedMode = -1;         // debug: -1 automatic, 0 no, 1 yes
@@ -110,14 +134,19 @@ inline com_ptr<ID3D11Device> device11;         // native D3D11 device of the gam
 inline com_ptr<ID3D11Device5> device11_5;
 inline com_ptr<ID3D11DeviceContext4> context11;
 inline com_ptr<ID3D12Device> device12;         // created through ReShade (proxy)
-inline com_ptr<ID3D12CommandQueue> queue12;
+inline com_ptr<ID3D12CommandQueue> queue12;    // Frame Generation work (render thread)
+inline com_ptr<ID3D12CommandQueue> presentQueue12; // swap chain queue: back buffer copies + presents
 inline com_ptr<ID3D12Fence> fence11to12;
 inline com_ptr<ID3D11Fence> fence11to12_11;
 inline uint64_t value11to12 = 0;               // render thread only
 inline com_ptr<ID3D12Fence> fence12;
 inline com_ptr<ID3D11Fence> fence12_11;
 inline uint64_t value12 = 0;                   // guarded by queueMutex
-inline std::mutex queueMutex;                  // all DX12 queue submissions and presents
+inline std::mutex queueMutex;                  // submissions to queue12
+inline com_ptr<ID3D12Fence> presentFence12;
+inline com_ptr<ID3D11Fence> presentFence12_11;
+inline uint64_t presentValue12 = 0;            // guarded by presentMutex
+inline std::mutex presentMutex;                // submissions to presentQueue12, presents, swap chain changes
 inline bool tearingSupported = false;
 inline bool dx12InitTried = false;
 
@@ -135,20 +164,33 @@ inline void Log(reshade::log::level level, const char* format, ...) {
     reshade::log::message(level, buffer);
 }
 
-// CPU wait until DirectX 12 reached 'value' on fence12.
-inline bool WaitForFence12(uint64_t value, DWORD timeoutMs = 2000) {
-    if (!fence12 || fence12->GetCompletedValue() >= value) {
+// CPU wait until a DirectX 12 fence reached 'value'.
+// The event is shared by all waits of a thread, so a wake-up left over from an earlier
+// timed-out wait is possible: the fence value is checked again after every wake-up.
+inline bool WaitForFence(ID3D12Fence* fence, uint64_t value, DWORD timeoutMs = 2000) {
+    if (!fence || value == 0 || fence->GetCompletedValue() >= value) {
         return true;
     }
     thread_local HANDLE event = CreateEventW(nullptr, FALSE, FALSE, nullptr);
-    if (FAILED(fence12->SetEventOnCompletion(value, event))) {
-        return false;
+    const ULONGLONG deadline = GetTickCount64() + timeoutMs;
+    for (;;) {
+        if (FAILED(fence->SetEventOnCompletion(value, event))) {
+            return false;
+        }
+        ULONGLONG now = GetTickCount64();
+        WaitForSingleObject(event, now >= deadline ? 0 : (DWORD)(deadline - now));
+        if (fence->GetCompletedValue() >= value) {
+            return true;
+        }
+        if (GetTickCount64() >= deadline) {
+            Log(reshade::log::level::warning, "GPU wait timed out (fence value %llu).", (unsigned long long)value);
+            return false;
+        }
     }
-    if (WaitForSingleObject(event, timeoutMs) != WAIT_OBJECT_0) {
-        Log(reshade::log::level::warning, "GPU wait timed out (fence %llu).", (unsigned long long)value);
-        return false;
-    }
-    return true;
+}
+
+inline bool WaitForFence12(uint64_t value, DWORD timeoutMs = 2000) {
+    return WaitForFence(fence12.get(), value, timeoutMs);
 }
 
 // Must be called with queueMutex held. Returns the value signaled.
@@ -156,6 +198,95 @@ inline uint64_t SignalQueueLocked() {
     uint64_t value = ++value12;
     queue12->Signal(fence12.get(), value);
     return value;
+}
+
+// Must be called with presentMutex held. Returns the value signaled.
+inline uint64_t SignalPresentQueueLocked() {
+    uint64_t value = ++presentValue12;
+    presentQueue12->Signal(presentFence12.get(), value);
+    return value;
+}
+
+// ---------------------------------------------------------------------------
+// Time helpers (QueryPerformanceCounter)
+// ---------------------------------------------------------------------------
+inline int64_t QpcFrequency() {
+    static const int64_t frequency = []() {
+        LARGE_INTEGER value;
+        QueryPerformanceFrequency(&value);
+        return (int64_t)value.QuadPart;
+    }();
+    return frequency;
+}
+
+inline int64_t QpcNow() {
+    LARGE_INTEGER value;
+    QueryPerformanceCounter(&value);
+    return (int64_t)value.QuadPart;
+}
+
+inline double QpcToSeconds(int64_t ticks) {
+    return (double)ticks / (double)QpcFrequency();
+}
+
+inline int64_t SecondsToQpc(double seconds) {
+    return (int64_t)(seconds * (double)QpcFrequency());
+}
+
+inline uint64_t QpcToNs(int64_t qpc) {
+    const int64_t f = QpcFrequency();
+    return (uint64_t)(qpc / f) * 1000000000ull + (uint64_t)((qpc % f) * 1000000000ll / f);
+}
+
+inline int64_t NsToQpc(uint64_t ns) {
+    const int64_t f = QpcFrequency();
+    return (int64_t)(ns / 1000000000ull) * f + (int64_t)((ns % 1000000000ull) * (uint64_t)f / 1000000000ull);
+}
+
+// Waits until 'target' (QPC ticks): sleeps with a high resolution timer, then spins for the
+// last ~0.5 ms. Returns early when stopEarly() returns true (checked about every 0.1 ms).
+template <typename StopEarly>
+inline void WaitUntilQpc(int64_t target, StopEarly&& stopEarly) {
+#ifndef CREATE_WAITABLE_TIMER_HIGH_RESOLUTION
+#define CREATE_WAITABLE_TIMER_HIGH_RESOLUTION 0x00000002
+#endif
+    thread_local HANDLE timer = []() {
+        HANDLE handle = CreateWaitableTimerExW(nullptr, nullptr, CREATE_WAITABLE_TIMER_HIGH_RESOLUTION, TIMER_ALL_ACCESS);
+        return handle ? handle : CreateWaitableTimerExW(nullptr, nullptr, 0, TIMER_ALL_ACCESS);
+    }();
+    const int64_t checkInterval = SecondsToQpc(0.0001);
+    int64_t nextCheck = 0;
+    for (;;) {
+        int64_t now = QpcNow();
+        if (now >= nextCheck) {
+            if (stopEarly()) {
+                return;
+            }
+            nextCheck = now + checkInterval;
+        }
+        double remaining = QpcToSeconds(target - now);
+        if (remaining <= 0.0) {
+            return;
+        }
+        if (remaining > 0.0008 && timer) {
+            double step = remaining - 0.0005;
+            if (step > 0.001) {
+                step = 0.001; // wake up every millisecond to check stopEarly()
+            }
+            LARGE_INTEGER due;
+            due.QuadPart = -(LONGLONG)(step * 10000000.0); // relative, 100 ns units
+            if (SetWaitableTimer(timer, &due, 0, nullptr, nullptr, FALSE)) {
+                WaitForSingleObject(timer, 20);
+                nextCheck = 0;
+                continue;
+            }
+        }
+        YieldProcessor();
+    }
+}
+
+inline void WaitUntilQpc(int64_t target) {
+    WaitUntilQpc(target, []() { return false; });
 }
 
 // DirectX 11 marks "everything submitted so far is finished"; returns the value.
@@ -169,17 +300,23 @@ inline uint64_t SignalFromD3D11() {
 
 // Waits until both DirectX 11 and DirectX 12 finished all submitted work. Render thread only.
 inline void FlushGpu() {
-    if (!context11 || !queue12 || !fence11to12_11 || !fence12) {
+    if (!context11 || !queue12 || !presentQueue12 || !fence11to12_11 || !fence12 || !presentFence12) {
         return;
     }
     uint64_t d3d11Done = SignalFromD3D11();
-    uint64_t allDone;
+    uint64_t workDone;
+    uint64_t presentDone;
     {
         std::lock_guard<std::mutex> lock(queueMutex);
         queue12->Wait(fence11to12.get(), d3d11Done);
-        allDone = SignalQueueLocked();
+        workDone = SignalQueueLocked();
     }
-    WaitForFence12(allDone, 5000);
+    {
+        std::lock_guard<std::mutex> lock(presentMutex);
+        presentDone = SignalPresentQueueLocked();
+    }
+    WaitForFence12(workDone, 5000);
+    WaitForFence(presentFence12.get(), presentDone, 5000);
 }
 
 inline bool CreateSharedFence(com_ptr<ID3D12Fence>& fence, com_ptr<ID3D11Fence>& fence11) {
@@ -276,12 +413,29 @@ inline bool InitDX12() {
         bridgeStatus = "failed: could not create the DirectX 12 queue";
         return false;
     }
+    // The present queue gets a higher priority so its small copies are not delayed by the game.
+    D3D12_COMMAND_QUEUE_DESC presentQueueDesc = queueDesc;
+    presentQueueDesc.Priority = D3D12_COMMAND_QUEUE_PRIORITY_HIGH;
+    if (FAILED(device12->CreateCommandQueue(&presentQueueDesc, __uuidof(ID3D12CommandQueue), (void**)&presentQueue12)) || !presentQueue12) {
+        presentQueue12.reset();
+        if (FAILED(device12->CreateCommandQueue(&queueDesc, __uuidof(ID3D12CommandQueue), (void**)&presentQueue12)) || !presentQueue12) {
+            presentQueue12.reset();
+            queue12.reset();
+            device12.reset();
+            bridgeStatus = "failed: could not create the DirectX 12 present queue";
+            return false;
+        }
+    }
 
-    if (!CreateSharedFence(fence11to12, fence11to12_11) || !CreateSharedFence(fence12, fence12_11)) {
+    if (!CreateSharedFence(fence11to12, fence11to12_11) || !CreateSharedFence(fence12, fence12_11) ||
+        !CreateSharedFence(presentFence12, presentFence12_11)) {
         fence11to12.reset();
         fence11to12_11.reset();
         fence12.reset();
         fence12_11.reset();
+        presentFence12.reset();
+        presentFence12_11.reset();
+        presentQueue12.reset();
         queue12.reset();
         device12.reset();
         bridgeStatus = "failed: could not share fences between DX11 and DX12";
@@ -722,16 +876,71 @@ inline void ReleaseFrameGenerationFeature() {
 // ---------------------------------------------------------------------------
 // The swap chain the game sees.
 // ---------------------------------------------------------------------------
+
+// Time between frames finished by the GPU, over the last 10 frames (used for pacing).
+class FrameTimeEstimator {
+public:
+    void Reset() {
+        _count = 0;
+        _next = 0;
+        _last = 0;
+    }
+
+    // 'finished': QPC time at which the GPU finished a frame.
+    void Add(int64_t finished) {
+        if (_last != 0) {
+            double interval = QpcToSeconds(finished - _last);
+            if (interval <= 0.0 || interval > 0.1) {
+                // Pause, loading or hitch (below 10 fps): start measuring again.
+                _count = 0;
+                _next = 0;
+            }
+            else {
+                _samples[_next] = interval;
+                _next = (_next + 1) % kSamples;
+                if (_count < kSamples) {
+                    _count++;
+                }
+            }
+        }
+        _last = finished;
+    }
+
+    bool Get(double& mean, double& deviation) const {
+        if (_count < 3) {
+            return false;
+        }
+        double sum = 0.0;
+        for (int i = 0; i < _count; ++i) {
+            sum += _samples[i];
+        }
+        mean = sum / _count;
+        double variance = 0.0;
+        for (int i = 0; i < _count; ++i) {
+            variance += (_samples[i] - mean) * (_samples[i] - mean);
+        }
+        deviation = std::sqrt(variance / _count);
+        return true;
+    }
+
+private:
+    static constexpr int kSamples = 10;
+    double _samples[kSamples] = {};
+    int _count = 0;
+    int _next = 0;
+    int64_t _last = 0;
+};
+
 class BridgeSwapChain final : public IDXGISwapChain4 {
 public:
     BridgeSwapChain(IDXGISwapChain3* real, IUnknown* gameDevice, const DXGI_SWAP_CHAIN_DESC& gameDesc, UINT realBufferCount, UINT realFlags)
         : _real(real), _gameDevice(gameDevice), _gameDesc(gameDesc), _realBufferCount(realBufferCount), _realFlags(realFlags) {
         _real->QueryInterface(&_real4);
-        QueryPerformanceFrequency(&_qpcFrequency);
     }
 
     bool Initialize() {
-        if (!CreateCommandRing(_renderRing) || !CreateCommandRing(_presentRing)) {
+        if (!CreateCommandRing(_renderRing, fence12.get()) || !CreateCommandRing(_presentRing, presentFence12.get()) ||
+            !CreateCommandRing(_directRing, presentFence12.get())) {
             return false;
         }
         if (!CreateBuffers()) {
@@ -741,7 +950,14 @@ public:
         _latencyWaitable = _real->GetFrameLatencyWaitableObject();
         ApplyDisplayQueue();
         UpdateRefreshRate();
-        _presenter = std::thread([this]() { PresenterLoop(); });
+        _presenter = std::thread([this]() {
+            SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_HIGHEST);
+            PresenterLoop();
+        });
+        _watcher = std::thread([this]() {
+            SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_HIGHEST);
+            WatcherLoop();
+        });
         return true;
     }
 
@@ -793,7 +1009,7 @@ public:
     }
     HRESULT STDMETHODCALLTYPE SetFullscreenState(BOOL fullscreen, IDXGIOutput* target) override {
         DrainPresenter();
-        std::lock_guard<std::mutex> lock(queueMutex);
+        std::lock_guard<std::mutex> lock(presentMutex);
         return _real->SetFullscreenState(fullscreen, target);
     }
     HRESULT STDMETHODCALLTYPE GetFullscreenState(BOOL* fullscreen, IDXGIOutput** target) override {
@@ -871,21 +1087,22 @@ public:
 
 private:
     static constexpr int kRingSize = 3;
-    static constexpr int kSlots = 2;
+    static constexpr int kSlots = 3;
 
-    // Command allocators + list used by one thread.
+    // Command allocators + list used by one thread on one queue.
     struct CommandRing {
         com_ptr<ID3D12CommandAllocator> allocators[kRingSize];
         uint64_t allocatorFence[kRingSize] = {};
         com_ptr<ID3D12GraphicsCommandList> list;
         uint64_t counter = 0;
+        ID3D12Fence* fence = nullptr; // fence the allocatorFence values belong to
     };
 
     // One frame handed to the presenter thread: generated frame + copy of the real frame.
     struct Slot {
         com_ptr<ID3D12Resource> generated; // UNORDERED_ACCESS state
         com_ptr<ID3D12Resource> real;      // UNORDERED_ACCESS state
-        uint64_t freeFence = 0;            // GPU finished presenting this slot
+        uint64_t freeFence = 0;            // presentFence12 value after the last copy out of this slot
         bool queued = false;               // guarded by _slotMutex
     };
 
@@ -894,7 +1111,22 @@ private:
         bool hasGenerated;
         UINT syncInterval;
         UINT flags;
-        double frameInterval; // seconds between frames rendered by the game
+        uint64_t workDone;       // fence12 value: the GPU finished this frame (generated + real frame ready)
+        uint64_t latencyFrameId; // LatencyFleX frame id (0 = not measured)
+        bool resetPacing;        // start measuring the frame time again
+        uint64_t sequence;       // number of the job (1, 2, 3...)
+    };
+
+    // A frame whose "GPU finished" moment is recorded by the watcher thread.
+    struct WatchItem {
+        uint64_t sequence;
+        uint64_t workDone;
+        uint64_t latencyFrameId;
+    };
+
+    struct SubmittedFrame {
+        ID3D12Fence* fence;
+        uint64_t value;
     };
 
     ~BridgeSwapChain() {
@@ -903,8 +1135,17 @@ private:
             _quit = true;
         }
         _jobCv.notify_all();
+        _pickedCv.notify_all();
         if (_presenter.joinable()) {
             _presenter.join();
+        }
+        {
+            std::lock_guard<std::mutex> lock(_watchMutex);
+            _watchQuit = true;
+        }
+        _watchCv.notify_all();
+        if (_watcher.joinable()) {
+            _watcher.join();
         }
         FlushGpu();
         ReleaseSlots();
@@ -920,7 +1161,8 @@ private:
         Log(reshade::log::level::info, "Bridged swap chain released.");
     }
 
-    bool CreateCommandRing(CommandRing& ring) {
+    bool CreateCommandRing(CommandRing& ring, ID3D12Fence* fence) {
+        ring.fence = fence;
         for (int i = 0; i < kRingSize; ++i) {
             if (FAILED(device12->CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_DIRECT, __uuidof(ID3D12CommandAllocator), (void**)&ring.allocators[i]))) {
                 return false;
@@ -933,10 +1175,10 @@ private:
         return true;
     }
 
-    // Opens the next command list of a ring. Returns the slot index used.
+    // Opens the next command list of a ring. Returns the allocator index used.
     int BeginCommands(CommandRing& ring) {
         int index = (int)(ring.counter++ % kRingSize);
-        WaitForFence12(ring.allocatorFence[index]);
+        WaitForFence(ring.fence, ring.allocatorFence[index], 10000);
         ring.allocators[index]->Reset();
         ring.list->Reset(ring.allocators[index].get(), nullptr);
         return index;
@@ -950,6 +1192,11 @@ private:
         barrier.Transition.StateBefore = before;
         barrier.Transition.StateAfter = after;
         list->ResourceBarrier(1, &barrier);
+    }
+
+    ID3D12Resource* CurrentBackBuffer() {
+        UINT index = _real->GetCurrentBackBufferIndex();
+        return _backBuffers12[index < _backBuffers12.size() ? index : 0].get();
     }
 
     UINT PresentFlags(UINT syncInterval, UINT flags) {
@@ -1042,7 +1289,10 @@ private:
     }
 
     HRESULT Resize(UINT bufferCount, UINT width, UINT height, DXGI_FORMAT format, UINT flags) {
-        DrainPresenter();
+        // The presenter must be idle before its textures and the back buffers are released.
+        for (int attempt = 0; attempt < 10 && !DrainPresenter(); ++attempt) {
+            Log(reshade::log::level::warning, "ResizeBuffers: still waiting for the presenter thread.");
+        }
         ReleaseFrameGenerationFeature();
         FlushGpu();
         ReleaseSlots();
@@ -1058,7 +1308,7 @@ private:
             (tearingSupported ? DXGI_SWAP_CHAIN_FLAG_ALLOW_TEARING : 0);
         HRESULT hr;
         {
-            std::lock_guard<std::mutex> lock(queueMutex);
+            std::lock_guard<std::mutex> lock(presentMutex);
             hr = _real->ResizeBuffers(_realBufferCount, width, height, realFormat, _realFlags);
         }
         if (FAILED(hr)) {
@@ -1074,20 +1324,10 @@ private:
             return E_FAIL;
         }
         _frameGenerationWasRunning = false;
+        _pacingResetPending = true;
+        _latencyResetPending = true;
         UpdateRefreshRate();
         return S_OK;
-    }
-
-    void MeasureFrameInterval() {
-        LARGE_INTEGER now;
-        QueryPerformanceCounter(&now);
-        if (_lastFrameTime.QuadPart != 0) {
-            double interval = (double)(now.QuadPart - _lastFrameTime.QuadPart) / (double)_qpcFrequency.QuadPart;
-            if (interval > 0.002 && interval < 0.2) {
-                _frameInterval = _frameInterval <= 0.0 ? interval : _frameInterval * 0.9 + interval * 0.1;
-            }
-        }
-        _lastFrameTime = now;
     }
 
     void ApplyDisplayQueue() {
@@ -1099,14 +1339,15 @@ private:
             queue = 3;
         }
         if (queue != _appliedDisplayQueue) {
-            std::lock_guard<std::mutex> lock(queueMutex);
+            std::lock_guard<std::mutex> lock(presentMutex);
             if (SUCCEEDED(_real->SetMaximumFrameLatency((UINT)queue))) {
                 _appliedDisplayQueue = queue;
             }
         }
     }
 
-    // Waits until DXGI accepts one more frame for the display. Call before Present, outside queueMutex.
+    // Waits until DXGI accepts one more frame for the display. Call before drawing into
+    // the back buffer, outside presentMutex.
     void WaitForDisplaySlot() {
         ApplyDisplayQueue();
         if (_latencyWaitable) {
@@ -1129,104 +1370,166 @@ private:
         }
     }
 
-    static double QpcSeconds(const LARGE_INTEGER& from, const LARGE_INTEGER& to, const LARGE_INTEGER& frequency) {
-        return (double)(to.QuadPart - from.QuadPart) / (double)frequency.QuadPart;
-    }
+    // -----------------------------------------------------------------------
+    // Input lag
+    // -----------------------------------------------------------------------
 
-    // NVIDIA Reflex on the game's DirectX 11 device: settings follow the menu.
-    void ApplyReflexSettings() {
-        bool want = reflexEnabled;
-        bool boost = reflexBoost;
-        if (!_reflexApplied || want != _reflexOn || boost != _reflexBoostOn) {
-            if (reflex::SetMode(device11.get(), want, want && boost)) {
-                _reflexOn = want;
-                _reflexBoostOn = boost;
-                _reflexApplied = true;
+    // Called at the end of every Present, i.e. right before the game starts its next frame.
+    // 'fence'/'submitted': the GPU work of the frame just handed over.
+    void LimitLatency(ID3D12Fence* fence, uint64_t submitted, bool throughPresenter) {
+        const int mode = latencyMode;
+
+        // 1) Hard limit: the game may only start a new frame when the GPU finished the frame
+        //    before the one just handed over (Off: two frames before).
+        const int ahead = mode == kLatencyOff ? 2 : 1;
+        if (fence && submitted) {
+            SubmittedFrame waitFor = {};
+            if (_submittedCount >= (uint64_t)ahead) {
+                waitFor = _submittedHistory[(_submittedCount - ahead) % kHistory];
             }
-            else if (!_reflexApplied) {
-                _reflexApplied = true; // do not retry every frame
-                _reflexOn = false;
+            _submittedHistory[_submittedCount % kHistory] = SubmittedFrame{ fence, submitted };
+            _submittedCount++;
+            if (waitFor.fence) {
+                WaitForFence(waitFor.fence, waitFor.value, 200);
             }
         }
-    }
-
-    void ReflexMarker(reflex::NV_LATENCY_MARKER_TYPE type) {
-        if (_reflexOn) {
-            reflex::Marker(device11.get(), _reflexFrameId, type);
+        // Same for the presenter (it is the slow part with V-Sync): besides the frame it is
+        // showing, at most one finished frame may wait for it.
+        if (throughPresenter && mode != kLatencyOff) {
+            std::unique_lock<std::mutex> lock(_jobMutex);
+            _pickedCv.wait_for(lock, std::chrono::milliseconds(100), [&]() { return _quit || _jobs.size() <= 1; });
         }
-    }
+        int64_t afterLimit = QpcNow();
 
-    // At most 'framesAhead' frames may be waiting for the GPU when the game starts its next frame.
-    // 'submitted' is the fence value of the DirectX 12 work of the frame just handed over.
-    void LimitFramesAhead(uint64_t submitted) {
-        if (submitted == 0) {
+        // 2) Automatic: LatencyFleX chooses when the next frame starts, so that it reaches the
+        //    GPU just when the GPU becomes free (no frames waiting in a queue = less input lag).
+        //    It needs the "frame finished" times measured by the watcher thread.
+        const bool useLatencyFleX = mode == kLatencyAutomatic && throughPresenter;
+        if (!useLatencyFleX) {
+            if (_latencyFleXActive) {
+                std::lock_guard<std::mutex> lock(_latencyMutex);
+                _latencyFleX.Reset();
+                _latencyFleXActive = false;
+            }
+            _latencyFrameId = 0;
+            statLatencySleepMs = 0.0f;
+            statLatencyMs = 0.0f;
             return;
         }
-        int ahead = framesAhead;
-        if (ahead < 0) {
-            ahead = 0;
+
+        uint64_t frameId;
+        uint64_t target;
+        {
+            std::lock_guard<std::mutex> lock(_latencyMutex);
+            if (!_latencyFleXActive || _latencyResetPending) {
+                _latencyFleX.Reset();
+                _latencyFleXActive = true;
+                _latencyResetPending = false;
+            }
+            frameId = ++_latencyNextFrameId;
+            target = _latencyFleX.GetWaitTarget(frameId);
         }
-        if (ahead > 2) {
-            ahead = 2;
+        uint64_t now = QpcToNs(afterLimit);
+        uint64_t wake = now;
+        // Safety: never wait longer than 50 ms or 1.5 game frames. A longer wait means the
+        // measurements are off (hitch, loading): do not wait, and start over if it repeats.
+        uint64_t maxWait = 50000000ull;
+        uint64_t frameNs = (uint64_t)(statFrameTimeMs.load() * 1.5f * 1000000.0f);
+        if (frameNs > maxWait && frameNs < 200000000ull) {
+            maxWait = frameNs;
         }
-        uint64_t waitFor = 0;
-        if (ahead == 0) {
-            waitFor = submitted;
+        if (target > now + maxWait) {
+            target = 0;
+            if (++_latencyOutliers >= 3) {
+                _latencyResetPending = true;
+                _latencyOutliers = 0;
+            }
         }
-        else if (_submittedCount >= (uint64_t)ahead) {
-            waitFor = _submittedHistory[(_submittedCount - ahead) % kHistory];
+        else {
+            _latencyOutliers = 0;
+            if (target > now) {
+                wake = target;
+                WaitUntilQpc(NsToQpc(wake));
+            }
         }
-        _submittedHistory[_submittedCount % kHistory] = submitted;
-        _submittedCount++;
-        if (waitFor != 0) {
-            WaitForFence12(waitFor, 200);
+        {
+            std::lock_guard<std::mutex> lock(_latencyMutex);
+            // Use the planned wake-up time as the frame start (see latencyflex.h, BeginFrame).
+            _latencyFleX.BeginFrame(frameId, target, wake);
+        }
+        _latencyFrameId = frameId;
+        double sleptMs = (double)(wake - now) / 1000000.0;
+        _sleepAverageMs = _sleepAverageMs * 0.95 + sleptMs * 0.05;
+        statLatencySleepMs = (float)_sleepAverageMs;
+    }
+
+    // Watcher thread: the GPU finished the frame 'frameId' at 'finishedQpc'.
+    void EndLatencyFrame(uint64_t frameId, int64_t finishedQpc) {
+        if (frameId == 0) {
+            return;
+        }
+        uint64_t latency = UINT64_MAX;
+        uint64_t frameTime = UINT64_MAX;
+        {
+            std::lock_guard<std::mutex> lock(_latencyMutex);
+            if (!_latencyFleXActive) {
+                return;
+            }
+            _latencyFleX.EndFrame(frameId, QpcToNs(finishedQpc), &latency, &frameTime);
+        }
+        if (latency != UINT64_MAX && (int64_t)latency > 0 && latency < 1000000000ull) {
+            double ms = (double)latency / 1000000.0;
+            _latencyAverageMs = _latencyAverageMs <= 0.0 ? ms : _latencyAverageMs * 0.95 + ms * 0.05;
+            statLatencyMs = (float)_latencyAverageMs;
         }
     }
 
     void RecordFrameTime(double seconds) {
-        LARGE_INTEGER now;
-        QueryPerformanceCounter(&now);
+        int64_t now = QpcNow();
         float ms = (float)(seconds * 1000.0);
         if (ms > _windowLongestMs) {
             _windowLongestMs = ms;
         }
-        if (_windowStart.QuadPart == 0) {
+        if (_windowStart == 0) {
             _windowStart = now;
         }
-        if (QpcSeconds(_windowStart, now, _qpcFrequency) >= 2.0) {
+        if (QpcToSeconds(now - _windowStart) >= 2.0) {
             statLongestFrameMs = _windowLongestMs;
             _windowLongestMs = 0.0f;
             _windowStart = now;
         }
-        if (ms > 50.0f && QpcSeconds(_lastSlowLog, now, _qpcFrequency) > 1.0) {
+        if (ms > 50.0f && QpcToSeconds(now - _lastSlowLog) > 1.0) {
             _lastSlowLog = now;
-            Log(reshade::log::level::warning, "Slow frame: Present took %.1f ms (waiting for the presenter %.1f ms, frame limit %.1f ms, Reflex %.1f ms, generated=%d, reason: %s).",
-                ms, _lastSlotWaitMs, _lastLimitWaitMs, _lastReflexMs, _lastGenerated ? 1 : 0, statLastSkipReason.load());
+            Log(reshade::log::level::warning, "Slow frame: Present took %.1f ms (waiting for the presenter %.1f ms, input lag limit %.1f ms, generated=%d, reason: %s).",
+                ms, _lastSlotWaitMs, _lastLimitWaitMs, _lastGenerated ? 1 : 0, statLastSkipReason.load());
         }
     }
 
+    // -----------------------------------------------------------------------
+    // Present (game's render thread)
+    // -----------------------------------------------------------------------
     HRESULT PresentFrame(UINT syncInterval, UINT flags) {
         if (flags & DXGI_PRESENT_TEST) {
+            std::lock_guard<std::mutex> lock(presentMutex);
             return _real->Present(syncInterval, DXGI_PRESENT_TEST);
         }
         if (!_shared12 || _backBuffers12.empty()) {
             return DXGI_ERROR_INVALID_CALL;
         }
-        LARGE_INTEGER start;
-        QueryPerformanceCounter(&start);
+        const int64_t start = QpcNow();
+        if (_lastPresentEnd != 0 && QpcToSeconds(start - _lastPresentEnd) > 0.2) {
+            // Long pause (loading, alt-tab, hitch): old measurements no longer apply.
+            _pacingResetPending = true;
+            _latencyResetPending = true;
+        }
         _lastSlotWaitMs = 0.0;
         _lastLimitWaitMs = 0.0;
-        _lastReflexMs = 0.0;
         _lastGenerated = false;
-
-        ReflexMarker(reflex::RENDERSUBMIT_END);
-        ReflexMarker(reflex::PRESENT_START);
 
         // End of a frame rendered by the game: let the add-on do its per-frame work.
         if (onGameFrameEnd) {
             onGameFrameEnd((uint64_t)_shared11.get(), _gameDesc.BufferDesc.Width, _gameDesc.BufferDesc.Height);
         }
-        MeasureFrameInterval();
 
         FrameInputs inputs = frameInputs;
         frameInputs.valid = false;
@@ -1236,12 +1539,16 @@ private:
         }
 
         HRESULT hr = S_OK;
+        ID3D12Fence* submittedFence = nullptr;
         uint64_t submitted = 0;
         bool throughPresenter = false;
         if (frameGenerationEnabled && !_frameGenerationFailed) {
             // Frames without Frame Generation data (menus, loading, videos) also go through the
             // presenter, so its rhythm is not broken by switching back and forth.
             throughPresenter = PresentThroughPresenter(syncInterval, flags, inputs, inputs.valid, submitted);
+            if (throughPresenter) {
+                submittedFence = fence12.get();
+            }
         }
         else if (!frameGenerationEnabled) {
             frameGenerationStatus = "off";
@@ -1251,29 +1558,15 @@ private:
             _frameGenerationWasRunning = false;
             DrainPresenter();
             hr = PresentDirect(syncInterval, flags, submitted);
+            submittedFence = presentFence12.get();
         }
 
-        ReflexMarker(reflex::PRESENT_END);
-
-        LARGE_INTEGER beforeLimit;
-        QueryPerformanceCounter(&beforeLimit);
-        LimitFramesAhead(submitted);
-        LARGE_INTEGER afterLimit;
-        QueryPerformanceCounter(&afterLimit);
-        _lastLimitWaitMs = QpcSeconds(beforeLimit, afterLimit, _qpcFrequency) * 1000.0;
-
-        // Start of the next frame (Reflex sleeps here when it is useful).
-        ApplyReflexSettings();
-        if (_reflexOn) {
-            reflex::Sleep(device11.get());
-            _reflexFrameId++;
-            ReflexMarker(reflex::SIMULATION_START);
-            ReflexMarker(reflex::RENDERSUBMIT_START);
-        }
-        LARGE_INTEGER end;
-        QueryPerformanceCounter(&end);
-        _lastReflexMs = QpcSeconds(afterLimit, end, _qpcFrequency) * 1000.0;
-        RecordFrameTime(QpcSeconds(start, end, _qpcFrequency));
+        const int64_t beforeLimit = QpcNow();
+        LimitLatency(submittedFence, submitted, throughPresenter);
+        const int64_t end = QpcNow();
+        _lastLimitWaitMs = QpcToSeconds(end - beforeLimit) * 1000.0;
+        _lastPresentEnd = end;
+        RecordFrameTime(QpcToSeconds(end - start));
         return hr;
     }
 
@@ -1283,27 +1576,26 @@ private:
         WaitForDisplaySlot();
         HRESULT hr;
         {
-            std::lock_guard<std::mutex> lock(queueMutex);
-            queue12->Wait(fence11to12.get(), gameFrameDone);
+            std::lock_guard<std::mutex> lock(presentMutex);
+            presentQueue12->Wait(fence11to12.get(), gameFrameDone);
 
-            int ringIndex = BeginCommands(_renderRing);
-            ID3D12GraphicsCommandList* list = _renderRing.list.get();
-            UINT index = _real->GetCurrentBackBufferIndex();
-            ID3D12Resource* backBuffer = _backBuffers12[index < _backBuffers12.size() ? index : 0].get();
+            int ringIndex = BeginCommands(_directRing);
+            ID3D12GraphicsCommandList* list = _directRing.list.get();
+            ID3D12Resource* backBuffer = CurrentBackBuffer();
             Transition(list, backBuffer, D3D12_RESOURCE_STATE_PRESENT, D3D12_RESOURCE_STATE_COPY_DEST);
             list->CopyResource(backBuffer, _shared12.get());
             Transition(list, backBuffer, D3D12_RESOURCE_STATE_COPY_DEST, D3D12_RESOURCE_STATE_PRESENT);
             list->Close();
             ID3D12CommandList* lists[] = { list };
-            queue12->ExecuteCommandLists(1, lists);
+            presentQueue12->ExecuteCommandLists(1, lists);
 
             hr = _real->Present(syncInterval, PresentFlags(syncInterval, flags));
 
-            copyDone = SignalQueueLocked();
-            _renderRing.allocatorFence[ringIndex] = copyDone;
+            copyDone = SignalPresentQueueLocked();
+            _directRing.allocatorFence[ringIndex] = copyDone;
         }
         // The game may only draw into the shared back buffer again after the copy finished.
-        context11->Wait(fence12_11.get(), copyDone);
+        context11->Wait(presentFence12_11.get(), copyDone);
 
         if (FAILED(hr) && hr != DXGI_ERROR_WAS_STILL_DRAWING) {
             Log(reshade::log::level::warning, "Present failed (0x%08X).", (unsigned)hr);
@@ -1342,24 +1634,20 @@ private:
             _frameGenerationWasRunning = false;
         }
 
-        // Wait for a free slot (the presenter may still be showing the slot from two frames ago).
+        // Wait for a free slot (the presenter may still be showing the slot from a few frames ago).
         int slotIndex = _nextSlot;
         _nextSlot = (_nextSlot + 1) % kSlots;
         Slot& slot = _slots[slotIndex];
         {
-            LARGE_INTEGER before;
-            QueryPerformanceCounter(&before);
+            int64_t before = QpcNow();
             std::unique_lock<std::mutex> lock(_slotMutex);
             bool free = _slotCv.wait_for(lock, std::chrono::milliseconds(500), [&]() { return !slot.queued; });
-            LARGE_INTEGER after;
-            QueryPerformanceCounter(&after);
-            _lastSlotWaitMs = QpcSeconds(before, after, _qpcFrequency) * 1000.0;
+            _lastSlotWaitMs = QpcToSeconds(QpcNow() - before) * 1000.0;
             if (!free) {
                 Log(reshade::log::level::warning, "Presenter thread is stuck; presenting without Frame Generation.");
                 return false;
             }
         }
-        WaitForFence12(slot.freeFence);
 
         uint64_t gameFrameDone = SignalFromD3D11();
         bool generated = false;
@@ -1368,6 +1656,10 @@ private:
         {
             std::lock_guard<std::mutex> lock(queueMutex);
             queue12->Wait(fence11to12.get(), gameFrameDone);
+            if (slot.freeFence != 0) {
+                // The presenter's last copy out of this slot must be finished before it is overwritten.
+                queue12->Wait(presentFence12.get(), slot.freeFence);
+            }
 
             int ringIndex = BeginCommands(_renderRing);
             ID3D12GraphicsCommandList* list = _renderRing.list.get();
@@ -1491,75 +1783,96 @@ private:
             std::lock_guard<std::mutex> lock(_slotMutex);
             slot.queued = true;
         }
+        const uint64_t sequence = ++_jobSequence;
+        {
+            std::lock_guard<std::mutex> lock(_watchMutex);
+            _watchItems.push_back(WatchItem{ sequence, workDone, _latencyFrameId });
+        }
+        _watchCv.notify_one();
         {
             std::lock_guard<std::mutex> lock(_jobMutex);
-            _jobs.push_back(Job{ slotIndex, generated, syncInterval, flags, _frameInterval });
+            _jobs.push_back(Job{ slotIndex, generated, syncInterval, flags, workDone, _latencyFrameId, _pacingResetPending, sequence });
         }
+        _pacingResetPending = false;
         _jobCv.notify_all();
         return true;
     }
 
-    // Copies a texture (UNORDERED_ACCESS state) into the current back buffer and presents it.
-    uint64_t PresentTexture(ID3D12Resource* source, UINT syncInterval, UINT flags) {
-        WaitForDisplaySlot();
-        std::lock_guard<std::mutex> lock(queueMutex);
-        int ringIndex = BeginCommands(_presentRing);
-        ID3D12GraphicsCommandList* list = _presentRing.list.get();
-        UINT index = _real->GetCurrentBackBufferIndex();
-        ID3D12Resource* backBuffer = _backBuffers12[index < _backBuffers12.size() ? index : 0].get();
-        Transition(list, backBuffer, D3D12_RESOURCE_STATE_PRESENT, D3D12_RESOURCE_STATE_COPY_DEST);
-        Transition(list, source, D3D12_RESOURCE_STATE_UNORDERED_ACCESS, D3D12_RESOURCE_STATE_COPY_SOURCE);
-        list->CopyResource(backBuffer, source);
-        Transition(list, source, D3D12_RESOURCE_STATE_COPY_SOURCE, D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
-        Transition(list, backBuffer, D3D12_RESOURCE_STATE_COPY_DEST, D3D12_RESOURCE_STATE_PRESENT);
-        list->Close();
-        ID3D12CommandList* lists[] = { list };
-        queue12->ExecuteCommandLists(1, lists);
+    // -----------------------------------------------------------------------
+    // Presenter thread
+    // -----------------------------------------------------------------------
 
-        HRESULT hr = _real->Present(syncInterval, PresentFlags(syncInterval, flags));
+    // True when the GPU already finished the next frame (the presenter is running late).
+    bool NextFrameReady() {
+        std::lock_guard<std::mutex> lock(_jobMutex);
+        if (_quit) {
+            return true;
+        }
+        return !_jobs.empty() && fence12->GetCompletedValue() >= _jobs.front().workDone;
+    }
+
+    // Copies a slot texture (UNORDERED_ACCESS state) into the back buffer, waits until the copy
+    // is finished and until 'target' (QPC, 0 = now), then presents. Returns the copy's fence value.
+    uint64_t ShowTexture(ID3D12Resource* source, const Job& job, int64_t target, bool stopWhenNextFrameReady) {
+        WaitForDisplaySlot();
+        uint64_t copied;
+        UINT copiedIndex;
+        {
+            std::lock_guard<std::mutex> lock(presentMutex);
+            // GPU-side order: the copy runs only after queue12 finished writing this slot
+            // (costs nothing when the CPU already saw it finish).
+            presentQueue12->Wait(fence12.get(), job.workDone);
+            int ringIndex = BeginCommands(_presentRing);
+            ID3D12GraphicsCommandList* list = _presentRing.list.get();
+            copiedIndex = _real->GetCurrentBackBufferIndex();
+            ID3D12Resource* backBuffer = CurrentBackBuffer();
+            Transition(list, backBuffer, D3D12_RESOURCE_STATE_PRESENT, D3D12_RESOURCE_STATE_COPY_DEST);
+            Transition(list, source, D3D12_RESOURCE_STATE_UNORDERED_ACCESS, D3D12_RESOURCE_STATE_COPY_SOURCE);
+            list->CopyResource(backBuffer, source);
+            Transition(list, source, D3D12_RESOURCE_STATE_COPY_SOURCE, D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
+            Transition(list, backBuffer, D3D12_RESOURCE_STATE_COPY_DEST, D3D12_RESOURCE_STATE_PRESENT);
+            list->Close();
+            ID3D12CommandList* lists[] = { list };
+            presentQueue12->ExecuteCommandLists(1, lists);
+            copied = SignalPresentQueueLocked();
+            _presentRing.allocatorFence[ringIndex] = copied;
+        }
+        // Present only once the image is really in the back buffer, so that it reaches the
+        // screen at the planned moment (not whenever the GPU gets to it).
+        WaitForFence(presentFence12.get(), copied, 500);
+        if (target != 0) {
+            bool early = false;
+            WaitUntilQpc(target, [&]() {
+                if (stopWhenNextFrameReady && NextFrameReady()) {
+                    early = true;
+                    return true;
+                }
+                return false;
+            });
+            if (early) {
+                statLateFrames++;
+            }
+        }
+        HRESULT hr = S_OK;
+        {
+            std::lock_guard<std::mutex> lock(presentMutex);
+            if (_real->GetCurrentBackBufferIndex() == copiedIndex) {
+                hr = _real->Present(job.syncInterval, PresentFlags(job.syncInterval, job.flags));
+            }
+            else {
+                // Someone else presented in between (only after a presenter time-out): skip this image.
+                Log(reshade::log::level::warning, "Presenter: back buffer changed before Present; frame skipped.");
+            }
+        }
+        _lastPresentQpc = QpcNow();
         if (FAILED(hr) && hr != DXGI_ERROR_WAS_STILL_DRAWING) {
             Log(reshade::log::level::warning, "Present failed (0x%08X).", (unsigned)hr);
         }
-        uint64_t done = SignalQueueLocked();
-        _presentRing.allocatorFence[ringIndex] = done;
-        return done;
+        return copied;
     }
 
-    bool JobWaiting() {
-        std::lock_guard<std::mutex> lock(_jobMutex);
-        return _quit || !_jobs.empty();
-    }
-
-    // Waits until 'target' (QPC ticks) with ~1 ms precision, or until the game hands over a new frame.
-    void WaitUntil(const LARGE_INTEGER& target) {
-#ifndef CREATE_WAITABLE_TIMER_HIGH_RESOLUTION
-#define CREATE_WAITABLE_TIMER_HIGH_RESOLUTION 0x00000002
-#endif
-        thread_local HANDLE timer = CreateWaitableTimerExW(nullptr, nullptr, CREATE_WAITABLE_TIMER_HIGH_RESOLUTION, TIMER_ALL_ACCESS);
-        for (;;) {
-            if (JobWaiting()) {
-                return;
-            }
-            LARGE_INTEGER now;
-            QueryPerformanceCounter(&now);
-            double remaining = QpcSeconds(now, target, _qpcFrequency);
-            if (remaining <= 0.0) {
-                return;
-            }
-            if (remaining > 0.0015 && timer) {
-                double step = remaining - 0.0005 < 0.001 ? remaining - 0.0005 : 0.001;
-                LARGE_INTEGER due;
-                due.QuadPart = -(LONGLONG)(step * 10000000.0); // relative, 100 ns units
-                if (SetWaitableTimer(timer, &due, 0, nullptr, nullptr, FALSE)) {
-                    WaitForSingleObject(timer, 10);
-                    continue;
-                }
-            }
-            YieldProcessor();
-        }
-    }
-
-    // Presenter thread: shows the generated frame, then the real frame half a frame later.
+    // Shows each frame handed over by the game: first the generated frame, then the real frame
+    // half a frame later. Times come from when the GPU really finished each frame.
     void PresenterLoop() {
         for (;;) {
             Job job;
@@ -1572,38 +1885,88 @@ private:
                 job = _jobs.front();
                 _jobs.pop_front();
             }
+            _pickedCv.notify_all();
             Slot& slot = _slots[job.slot];
+            if (job.resetPacing) {
+                _frameTimes.Reset();
+            }
 
-            if (job.hasGenerated) {
-                PresentTexture(slot.generated.get(), job.syncInterval, job.flags);
-                if (job.syncInterval == 0 && job.frameInterval > 0.0) {
-                    // Pace: the real frame goes half a frame after the generated one,
-                    // unless the game already finished its next frame.
-                    double wait = job.frameInterval * 0.5;
-                    if (wait > 0.05) {
-                        wait = 0.05;
-                    }
-                    LARGE_INTEGER target;
-                    QueryPerformanceCounter(&target);
-                    target.QuadPart += (LONGLONG)(wait * (double)_qpcFrequency.QuadPart);
-                    WaitUntil(target);
+            // 1) Wait until the GPU finished this frame (game frame + generated frame + real frame copy).
+            //    The exact moment is taken from the watcher thread when it already recorded it.
+            WaitForFence12(job.workDone, 1000);
+            int64_t finished = QpcNow();
+            const int finishedIndex = (int)(job.sequence % kFinishedRing);
+            if (_finishedSequence[finishedIndex].load(std::memory_order_acquire) == job.sequence) {
+                finished = _finishedQpc[finishedIndex].load(std::memory_order_relaxed);
+            }
+            _frameTimes.Add(finished);
+
+            // 2) Half the time between finished frames, a little less when it varies
+            //    (showing the real frame slightly early is better than late).
+            int64_t halfFrame = 0;
+            double mean = 0.0;
+            double deviation = 0.0;
+            if (_frameTimes.Get(mean, deviation)) {
+                statFrameTimeMs = (float)(mean * 1000.0);
+                statFrameJitterMs = (float)(deviation * 1000.0);
+                double half = mean * 0.5 - deviation * 0.25 - 0.0001;
+                if (half > 0.05) {
+                    half = 0.05;
+                }
+                if (half > 0.0) {
+                    halfFrame = SecondsToQpc(half);
                 }
             }
-            uint64_t done = PresentTexture(slot.real.get(), job.syncInterval, job.flags);
+            // With V-Sync the display itself spaces the frames.
+            const bool paced = job.syncInterval == 0 && halfFrame > 0 && _lastPresentQpc != 0;
+
+            uint64_t lastCopy = 0;
+            if (job.hasGenerated) {
+                // Generated frame: as soon as it is ready, but not closer than half a frame to the previous frame.
+                lastCopy = ShowTexture(slot.generated.get(), job, paced ? _lastPresentQpc + halfFrame : 0, false);
+                // Real frame: half a frame after the generated one (sooner if the next frame is already done).
+                lastCopy = ShowTexture(slot.real.get(), job, paced ? _lastPresentQpc + halfFrame : 0, true);
+            }
+            else {
+                lastCopy = ShowTexture(slot.real.get(), job, 0, false);
+            }
 
             {
                 std::lock_guard<std::mutex> lock(_slotMutex);
-                slot.freeFence = done;
+                slot.freeFence = lastCopy;
                 slot.queued = false;
             }
             _slotCv.notify_all();
         }
     }
 
-    // Waits until the presenter thread has shown everything handed to it.
-    void DrainPresenter() {
+    // Watcher thread: only waits for each frame to be finished by the GPU and notes the moment
+    // (exact times for pacing and LatencyFleX, even while the presenter is busy).
+    void WatcherLoop() {
+        for (;;) {
+            WatchItem item;
+            {
+                std::unique_lock<std::mutex> lock(_watchMutex);
+                _watchCv.wait(lock, [&]() { return _watchQuit || !_watchItems.empty(); });
+                if (_watchItems.empty()) {
+                    break; // quitting
+                }
+                item = _watchItems.front();
+                _watchItems.pop_front();
+            }
+            WaitForFence12(item.workDone, 1000);
+            const int64_t finished = QpcNow();
+            const int index = (int)(item.sequence % kFinishedRing);
+            _finishedQpc[index].store(finished, std::memory_order_relaxed);
+            _finishedSequence[index].store(item.sequence, std::memory_order_release);
+            EndLatencyFrame(item.latencyFrameId, finished);
+        }
+    }
+
+    // Waits until the presenter thread has shown everything handed to it (false: timed out).
+    bool DrainPresenter() {
         std::unique_lock<std::mutex> lock(_slotMutex);
-        _slotCv.wait_for(lock, std::chrono::milliseconds(1000), [&]() {
+        return _slotCv.wait_for(lock, std::chrono::milliseconds(1000), [&]() {
             for (const Slot& slot : _slots) {
                 if (slot.queued) {
                     return false;
@@ -1625,8 +1988,9 @@ private:
     com_ptr<ID3D11Texture2D> _shared11;
     std::vector<com_ptr<ID3D12Resource>> _backBuffers12;
 
-    CommandRing _renderRing;  // used by the game's render thread
-    CommandRing _presentRing; // used by the presenter thread
+    CommandRing _renderRing;  // render thread, queue12
+    CommandRing _presentRing; // presenter thread, presentQueue12
+    CommandRing _directRing;  // render thread, presentQueue12 (Frame Generation off)
 
     Slot _slots[kSlots];
     int _nextSlot = 0;
@@ -1636,33 +2000,51 @@ private:
     std::thread _presenter;
     std::mutex _jobMutex;
     std::condition_variable _jobCv;
+    std::condition_variable _pickedCv; // the presenter took a job
     std::deque<Job> _jobs;
     bool _quit = false;
+    uint64_t _jobSequence = 0; // render thread
 
-    LARGE_INTEGER _qpcFrequency = {};
-    LARGE_INTEGER _lastFrameTime = {};
-    double _frameInterval = 0.0;
+    std::thread _watcher;
+    std::mutex _watchMutex;
+    std::condition_variable _watchCv;
+    std::deque<WatchItem> _watchItems;
+    bool _watchQuit = false;
+    static constexpr int kFinishedRing = 8;
+    std::atomic<int64_t> _finishedQpc[kFinishedRing];
+    std::atomic<uint64_t> _finishedSequence[kFinishedRing];
+
     bool _frameGenerationWasRunning = false;
     bool _frameGenerationFailed = false;
 
-    // Latency
+    // Pacing (presenter thread)
+    FrameTimeEstimator _frameTimes;
+    int64_t _lastPresentQpc = 0;
+    bool _pacingResetPending = true; // render thread, handed over with the next job
+
+    // Input lag
     static constexpr int kHistory = 4;
-    uint64_t _submittedHistory[kHistory] = {};
+    SubmittedFrame _submittedHistory[kHistory] = {};
     uint64_t _submittedCount = 0;
     HANDLE _latencyWaitable = nullptr;
-    int _appliedDisplayQueue = 0;
-    bool _reflexApplied = false;
-    bool _reflexOn = false;
-    bool _reflexBoostOn = false;
-    uint64_t _reflexFrameId = 1;
+    std::atomic<int> _appliedDisplayQueue = 0; // render and presenter threads
+    std::mutex _latencyMutex;          // _latencyFleX is used by the render and presenter threads
+    lfx::LatencyFleX _latencyFleX;
+    bool _latencyFleXActive = false;   // guarded by _latencyMutex
+    bool _latencyResetPending = true;  // render thread
+    uint64_t _latencyNextFrameId = 0;  // render thread
+    uint64_t _latencyFrameId = 0;      // render thread: id of the frame the game is rendering now
+    double _sleepAverageMs = 0.0;      // render thread
+    double _latencyAverageMs = 0.0;    // watcher thread
+    int _latencyOutliers = 0;          // render thread
+    int64_t _lastPresentEnd = 0;       // render thread
 
     // Statistics
-    LARGE_INTEGER _windowStart = {};
-    LARGE_INTEGER _lastSlowLog = {};
+    int64_t _windowStart = 0;
+    int64_t _lastSlowLog = 0;
     float _windowLongestMs = 0.0f;
     double _lastSlotWaitMs = 0.0;
     double _lastLimitWaitMs = 0.0;
-    double _lastReflexMs = 0.0;
     bool _lastGenerated = false;
 };
 
@@ -1697,7 +2079,7 @@ inline HRESULT STDMETHODCALLTYPE CreateSwapChainHook(IDXGIFactory* factory, IUnk
         (tearingSupported ? DXGI_SWAP_CHAIN_FLAG_ALLOW_TEARING : 0);
 
     IDXGISwapChain* realSwapChain = nullptr;
-    HRESULT hr = previousCreateSwapChain(factory, queue12.get(), &realDesc, &realSwapChain);
+    HRESULT hr = previousCreateSwapChain(factory, presentQueue12.get(), &realDesc, &realSwapChain);
     com_ptr<IDXGISwapChain3> realSwapChain3;
     if (SUCCEEDED(hr) && realSwapChain) {
         realSwapChain->QueryInterface(&realSwapChain3);
