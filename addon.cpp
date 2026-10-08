@@ -807,7 +807,7 @@ static void drawSettings(reshade::api::effect_runtime*)
     }
     if (fg::bridgeActive) {
         bool frameGeneration = fg::frameGenerationEnabled;
-        if (ImGui::Checkbox("DLSS Frame Generation (2x)", &frameGeneration)) {
+        if (ImGui::Checkbox("DLSS Frame Generation", &frameGeneration)) {
             fg::frameGenerationEnabled = frameGeneration;
             if (frameGeneration) {
                 fg::frameGenerationRetry = true;
@@ -818,8 +818,15 @@ static void drawSettings(reshade::api::effect_runtime*)
         if (fg::frameGenerationEnabled && *fg::frameGenerationProblem.load()) {
             ImGui::Text("Problem: %s", fg::frameGenerationProblem.load());
         }
+        int multiplier = fg::frameGenerationMultiplier - 2;
+        const char* multiplierNames[] = { "2x", "3x (Multi Frame Generation)", "4x (Multi Frame Generation)" };
+        if (ImGui::Combo("Frames per real frame", &multiplier, multiplierNames, 3)) {
+            fg::frameGenerationMultiplier = multiplier + 2;
+            reshade::set_config_value(nullptr, "DLAA", "FGMultiplier", multiplier + 2);
+        }
+        ImGui::Text("Multi Frame Generation unlock (RTX 40): %s", mfg::status.load());
         if (fg::multiFrameCountMax.load() > 0) {
-            ImGui::Text("Driver limit: up to %u generated frame(s) per real frame", fg::multiFrameCountMax.load());
+            ImGui::Text("Driver reports up to %u generated frame(s) per real frame", fg::multiFrameCountMax.load());
         }
 
         // Latency
@@ -855,7 +862,7 @@ static void drawSettings(reshade::api::effect_runtime*)
             (unsigned long long)fg::statGenerated.load(), (unsigned long long)fg::statNotGenerated.load(),
             (unsigned long long)fg::statCameraReused.load());
         ImGui::Text("Last frame without generation: %s", fg::statLastSkipReason.load());
-        ImGui::Text("Longest wait in Present (last 2 s): %.1f ms | real frames shown early: %llu",
+        ImGui::Text("Longest wait in Present (last 2 s): %.1f ms | frames shown early (running late): %llu",
             fg::statLongestFrameMs.load(), (unsigned long long)fg::statLateFrames.load());
         if (ImGui::TreeNode("Frame Generation debug options")) {
             bool transpose = fg::transposeMatrices;
@@ -920,6 +927,9 @@ void OnInitDevice(reshade::api::device* device) {
         int displayQueue = 1;
         reshade::get_config_value(nullptr, "DLAA", "DisplayQueue", displayQueue);
         fg::displayQueue = (displayQueue >= 1 && displayQueue <= 3) ? displayQueue : 1;
+        int multiplier = 2;
+        reshade::get_config_value(nullptr, "DLAA", "FGMultiplier", multiplier);
+        fg::frameGenerationMultiplier = (multiplier >= 2 && multiplier <= 4) ? multiplier : 2;
         int latencyMode = fg::kLatencyAutomatic;
         reshade::get_config_value(nullptr, "DLAA", "LatencyMode", latencyMode);
         fg::latencyMode = (latencyMode >= fg::kLatencyOff && latencyMode <= fg::kLatencyAutomatic) ? latencyMode : fg::kLatencyAutomatic;
