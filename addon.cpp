@@ -12,6 +12,8 @@
 #include <atomic>
 #include <unordered_map>
 #include <cstdio>
+#include <cstring>
+#include <string>
 
 #include "intermediate/PrepareMotionVectors.h"
 #include "intermediate/0x0D1CD1AA.h"
@@ -45,14 +47,15 @@ bool autoExposure = false;
 float sharpenMultiplier = 1.0f;
 
 // ---------------------------------------------------------------------------
-// Diagnostic frame recorder.
+// Diagnostic frame recorder (v2).
 // Records one frame of the game's render passes into ReShade.log so we can
-// map the pipeline (render resolution, where the upscale happens, where the
-// HUD is drawn). Needed before adding DLSS Super Resolution and Frame Generation.
+// map the pipeline before adding DLSS Super Resolution and Frame Generation.
+// Every texture gets a short id (T1, T2, ...) for the duration of the capture,
+// so the data flow between passes can be followed (who writes, who reads).
 // ---------------------------------------------------------------------------
 struct DiagPass {
     ID3D11RenderTargetView* rtv = nullptr; // identity only, never dereferenced
-    char line[640] = {};
+    std::string line;
     uint32_t draws = 0;
     bool open = false;
 };
@@ -60,43 +63,87 @@ struct DiagPass {
 std::mutex diagMutex;
 std::unordered_map<uint64_t, uint32_t> pixelShaderHashes; // guarded by diagMutex
 std::unordered_map<ID3D11DeviceContext*, DiagPass> diagPasses; // guarded by diagMutex
+std::unordered_map<ID3D11Resource*, uint32_t> diagIds; // guarded by diagMutex
 std::atomic<bool> diagRequested = false;
 std::atomic<bool> diagCapturing = false;
 uint32_t diagPassIndex = 0;
 uint64_t diagBackBuffer = 0;
 
-static void DiagLog(const char* text) {
-    reshade::log::message(reshade::log::level::info, text);
+// CPU copy of the TAA constant buffer (cbTemporalAA), taken when the game
+// unmaps it. Lets us read the exact jitter/screen size the TAA pass used.
+std::mutex taaShadowMutex;
+std::atomic<ID3D11Buffer*> taaConstantBuffer = nullptr; // identity only
+void* taaConstantBufferMapped = nullptr; // guarded by taaShadowMutex
+float taaConstantBufferShadow[64] = {}; // guarded by taaShadowMutex
+bool taaConstantBufferShadowValid = false; // guarded by taaShadowMutex
+ID3D11Buffer* taaConstantBufferShadowSource = nullptr; // guarded by taaShadowMutex, identity only
+
+static void DiagLog(const std::string& text) {
+    reshade::log::message(reshade::log::level::info, text.c_str());
 }
 
-static void DiagDescribeTexture(ID3D11Resource* resource, char* out, size_t outSize) {
+// Caller must hold diagMutex.
+static std::string DiagTex(ID3D11Resource* resource) {
     if (!resource) {
-        snprintf(out, outSize, "-");
-        return;
+        return "-";
     }
+    uint32_t id;
+    auto it = diagIds.find(resource);
+    if (it == diagIds.end()) {
+        id = (uint32_t)diagIds.size() + 1;
+        diagIds[resource] = id;
+    }
+    else {
+        id = it->second;
+    }
+
+    char buffer[128];
     com_ptr<ID3D11Texture2D> texture;
-    if (FAILED(resource->QueryInterface(&texture)) || !texture) {
-        snprintf(out, outSize, "(not 2D)");
-        return;
+    com_ptr<ID3D11Buffer> buf;
+    if (SUCCEEDED(resource->QueryInterface(&texture)) && texture) {
+        D3D11_TEXTURE2D_DESC desc;
+        texture->GetDesc(&desc);
+        snprintf(buffer, sizeof(buffer), "T%u(%ux%u f%u%s%s)", id, desc.Width, desc.Height, (unsigned)desc.Format,
+            desc.ArraySize > 1 ? " array" : "",
+            (uint64_t)resource == diagBackBuffer ? " BACKBUFFER" : "");
     }
-    D3D11_TEXTURE2D_DESC desc;
-    texture->GetDesc(&desc);
-    snprintf(out, outSize, "%ux%u fmt=%u", desc.Width, desc.Height, (unsigned)desc.Format);
+    else if (SUCCEEDED(resource->QueryInterface(&buf)) && buf) {
+        D3D11_BUFFER_DESC desc;
+        buf->GetDesc(&desc);
+        snprintf(buffer, sizeof(buffer), "B%u(buffer %u bytes)", id, desc.ByteWidth);
+    }
+    else {
+        snprintf(buffer, sizeof(buffer), "R%u(other)", id);
+    }
+    return buffer;
 }
 
-static void DiagDescribeView(ID3D11View* view, char* out, size_t outSize) {
-    com_ptr<ID3D11Resource> resource;
-    if (view) {
-        view->GetResource(&resource);
+// Caller must hold diagMutex.
+static std::string DiagView(ID3D11View* view) {
+    if (!view) {
+        return "-";
     }
-    DiagDescribeTexture(resource.get(), out, outSize);
+    com_ptr<ID3D11Resource> resource;
+    view->GetResource(&resource);
+    return DiagTex(resource.get());
+}
+
+// Caller must hold diagMutex.
+static std::string DiagListSRVs(ID3D11ShaderResourceView** srvs, UINT count) {
+    std::string text;
+    for (UINT i = 0; i < count; ++i) {
+        if (srvs[i]) {
+            text += " t" + std::to_string(i) + "=" + DiagView(srvs[i]);
+            srvs[i]->Release();
+            srvs[i] = nullptr;
+        }
+    }
+    return text.empty() ? " (none)" : text;
 }
 
 static void DiagFlushPass(DiagPass& pass) {
     if (pass.open) {
-        char buffer[700];
-        snprintf(buffer, sizeof(buffer), "%s draws=%u", pass.line, pass.draws);
-        DiagLog(buffer);
+        DiagLog(pass.line + " draws=" + std::to_string(pass.draws));
         pass.open = false;
     }
 }
@@ -112,33 +159,60 @@ static void DiagOnGpuWork(ID3D11DeviceContext* ctx, bool isDispatch) {
 
     const char* contextTag = ctx->GetType() == D3D11_DEVICE_CONTEXT_DEFERRED ? " [deferred]" : "";
     DiagPass& pass = diagPasses[ctx];
+    char header[64];
 
     if (isDispatch) {
         DiagFlushPass(pass);
         pass.rtv = nullptr;
-        com_ptr<ID3D11UnorderedAccessView> uav;
-        ctx->CSGetUnorderedAccessViews(0, 1, &uav);
-        char uavText[64];
-        DiagDescribeView(uav.get(), uavText, sizeof(uavText));
-        char buffer[200];
-        snprintf(buffer, sizeof(buffer), "[DLAA-DIAG] #%03u COMPUTE uav0=%s%s", diagPassIndex++, uavText, contextTag);
-        DiagLog(buffer);
+
+        ID3D11UnorderedAccessView* uavs[2] = {};
+        ctx->CSGetUnorderedAccessViews(0, 2, uavs);
+        std::string uavText;
+        for (int i = 0; i < 2; ++i) {
+            if (uavs[i]) {
+                uavText += " u" + std::to_string(i) + "=" + DiagView(uavs[i]);
+                uavs[i]->Release();
+            }
+        }
+        ID3D11ShaderResourceView* srvs[4] = {};
+        ctx->CSGetShaderResources(0, 4, srvs);
+        std::string srvText = DiagListSRVs(srvs, 4);
+
+        snprintf(header, sizeof(header), "[DLAA-DIAG] #%03u COMPUTE", diagPassIndex++);
+        DiagLog(std::string(header) + " out:" + (uavText.empty() ? " (none)" : uavText) + " in:" + srvText + contextTag);
         return;
     }
 
-    com_ptr<ID3D11RenderTargetView> rtv;
+    ID3D11RenderTargetView* rtvs[8] = {};
     com_ptr<ID3D11DepthStencilView> dsv;
-    ctx->OMGetRenderTargets(1, &rtv, &dsv);
+    ctx->OMGetRenderTargets(8, rtvs, &dsv);
+    ID3D11RenderTargetView* rtv0 = rtvs[0];
 
-    if (pass.open && rtv.get() == pass.rtv) {
+    if (pass.open && rtv0 == pass.rtv) {
         pass.draws++;
+        for (auto* view : rtvs) {
+            if (view) {
+                view->Release();
+            }
+        }
         return;
     }
     DiagFlushPass(pass);
 
+    std::string rtText;
+    for (int i = 0; i < 8; ++i) {
+        if (rtvs[i]) {
+            rtText += " rt" + std::to_string(i) + "=" + DiagView(rtvs[i]);
+        }
+    }
+    if (rtText.empty()) {
+        rtText = " (no color target)";
+    }
+    std::string dsvText = dsv ? DiagView(dsv.get()) : "-";
+
     com_ptr<ID3D11PixelShader> ps;
     ctx->PSGetShader(&ps, nullptr, nullptr);
-    char psText[32];
+    char psText[48];
     auto hashIt = pixelShaderHashes.find((uint64_t)ps.get());
     if (!ps) {
         snprintf(psText, sizeof(psText), "none");
@@ -157,31 +231,64 @@ static void DiagOnGpuWork(ID3D11DeviceContext* ctx, bool isDispatch) {
         tag = " <<SHARPEN>>";
     }
 
-    com_ptr<ID3D11Resource> rtResource;
-    if (rtv) {
-        rtv->GetResource(&rtResource);
+    com_ptr<ID3D11BlendState> blendState;
+    FLOAT blendFactor[4];
+    UINT sampleMask;
+    ctx->OMGetBlendState(&blendState, blendFactor, &sampleMask);
+    bool blendOn = false;
+    if (blendState) {
+        D3D11_BLEND_DESC blendDesc;
+        blendState->GetDesc(&blendDesc);
+        blendOn = blendDesc.RenderTarget[0].BlendEnable != FALSE;
     }
-    char rtText[64];
-    DiagDescribeTexture(rtResource.get(), rtText, sizeof(rtText));
-    const char* backBufferTag = (rtResource && (uint64_t)rtResource.get() == diagBackBuffer) ? " [BACKBUFFER]" : "";
-
-    com_ptr<ID3D11ShaderResourceView> srv0;
-    ctx->PSGetShaderResources(0, 1, &srv0);
-    char srvText[64];
-    DiagDescribeView(srv0.get(), srvText, sizeof(srvText));
 
     UINT viewportCount = 1;
     D3D11_VIEWPORT viewport = {};
     ctx->RSGetViewports(&viewportCount, &viewport);
 
-    snprintf(pass.line, sizeof(pass.line),
-        "[DLAA-DIAG] #%03u DRAW rt0=%s%s viewport=%.0fx%.0f+%.0f,%.0f depth=%s ps=%s srv0=%s%s%s",
-        diagPassIndex++, rtText, backBufferTag,
+    ID3D11ShaderResourceView* srvs[8] = {};
+    ctx->PSGetShaderResources(0, 8, srvs);
+    std::string srvText = DiagListSRVs(srvs, 8);
+
+    char details[160];
+    snprintf(details, sizeof(details), " viewport=%.0fx%.0f+%.0f,%.0f blend=%s ps=%s",
         viewport.Width, viewport.Height, viewport.TopLeftX, viewport.TopLeftY,
-        dsv ? "yes" : "no", psText, srvText, tag, contextTag);
-    pass.rtv = rtv.get();
+        blendOn ? "on" : "off", psText);
+    snprintf(header, sizeof(header), "[DLAA-DIAG] #%03u DRAW", diagPassIndex++);
+
+    pass.line = std::string(header) + " out:" + rtText + " depth=" + dsvText + details + tag + " in:" + srvText + contextTag;
+    pass.rtv = rtv0;
     pass.draws = 1;
     pass.open = true;
+
+    for (auto* view : rtvs) {
+        if (view) {
+            view->Release();
+        }
+    }
+}
+
+// Called from the TAA branch of OnDraw with the constant buffer bound to the TAA pass.
+static void DiagOnTAA(ID3D11Buffer* cbTemporalAA, uint32_t rtWidth, uint32_t rtHeight) {
+    if (!diagCapturing) {
+        return;
+    }
+    char buffer[400];
+    std::lock_guard<std::mutex> lock(taaShadowMutex);
+    if (taaConstantBufferShadowValid && taaConstantBufferShadowSource == cbTemporalAA) {
+        const float* c = taaConstantBufferShadow;
+        snprintf(buffer, sizeof(buffer),
+            "[DLAA-DIAG]      TAA constants: screenSize=%.1f,%.1f,%.6f,%.6f frameBits=%.3f,%.3f,%.3f,%.3f "
+            "jitterUV=%.6f,%.6f,%.6f,%.6f | jitter used by mod=%.6f,%.6f | taa target=%ux%u",
+            c[0], c[1], c[2], c[3], c[4], c[5], c[6], c[7], c[8], c[9], c[10], c[11],
+            jitter[0], jitter[1], rtWidth, rtHeight);
+    }
+    else {
+        snprintf(buffer, sizeof(buffer),
+            "[DLAA-DIAG]      TAA constants: not captured (buffer changed or not mapped yet) | jitter used by mod=%.6f,%.6f | taa target=%ux%u",
+            jitter[0], jitter[1], rtWidth, rtHeight);
+    }
+    DiagLog(buffer);
 }
 
 static void DiagOnPresent(swapchain* swapchain) {
@@ -193,18 +300,18 @@ static void DiagOnPresent(swapchain* swapchain) {
         DiagLog("[DLAA-DIAG] ===== END OF FRAME =====");
         diagCapturing = false;
         diagPasses.clear();
+        diagIds.clear();
     }
     if (diagRequested) {
         diagRequested = false;
         diagPassIndex = 0;
         diagPasses.clear();
+        diagIds.clear();
         diagBackBuffer = swapchain->get_current_back_buffer().handle;
-        char backBufferText[64];
-        DiagDescribeTexture((ID3D11Resource*)diagBackBuffer, backBufferText, sizeof(backBufferText));
-        char buffer[200];
-        snprintf(buffer, sizeof(buffer), "[DLAA-DIAG] ===== START OF FRAME ===== backbuffer=%s jitter=%f,%f",
-            backBufferText, jitter[0], jitter[1]);
-        DiagLog(buffer);
+        std::string backBufferText = DiagTex((ID3D11Resource*)diagBackBuffer);
+        char buffer[160];
+        snprintf(buffer, sizeof(buffer), " dlss=%s", dlssAvailable ? "available" : "NOT available");
+        DiagLog("[DLAA-DIAG] ===== START OF FRAME (v2) ===== backbuffer=" + backBufferText + buffer);
         diagCapturing = true;
     }
 }
@@ -533,6 +640,8 @@ bool OnDraw(reshade::api::command_list* cmd_list,
 
         com_ptr<ID3D11Buffer> cbTemporalAA;
         deviceContext->PSGetConstantBuffers(0, 1, &cbTemporalAA);
+        taaConstantBuffer = cbTemporalAA.get();
+        DiagOnTAA(cbTemporalAA.get(), width, height);
 
         com_ptr<ID3D11ShaderResourceView> inColorSRV;
         deviceContext->PSGetShaderResources(0, 1, &inColorSRV);
@@ -619,11 +728,27 @@ void OnMapBufferRegion(
     if (bd.ByteWidth == 256) {
         mappedConstantBuffer = *mapped_data;
     }
+    if ((ID3D11Buffer*)resource.handle == taaConstantBuffer.load() && mapped_data && *mapped_data) {
+        std::lock_guard<std::mutex> lock(taaShadowMutex);
+        taaConstantBufferMapped = *mapped_data;
+    }
 }
 
 void OnUnmapBufferRegion(
     device* device,
     resource resource) {
+    if ((ID3D11Buffer*)resource.handle == taaConstantBuffer.load()) {
+        std::lock_guard<std::mutex> lock(taaShadowMutex);
+        if (taaConstantBufferMapped) {
+            D3D11_BUFFER_DESC bd;
+            ((ID3D11Buffer*)resource.handle)->GetDesc(&bd);
+            size_t bytes = bd.ByteWidth < sizeof(taaConstantBufferShadow) ? bd.ByteWidth : sizeof(taaConstantBufferShadow);
+            memcpy(taaConstantBufferShadow, taaConstantBufferMapped, bytes);
+            taaConstantBufferShadowValid = true;
+            taaConstantBufferShadowSource = (ID3D11Buffer*)resource.handle;
+            taaConstantBufferMapped = nullptr;
+        }
+    }
     if (mappedConstantBuffer) {
         jitter[0] = ((float*)mappedConstantBuffer)[8];
         jitter[1] = ((float*)mappedConstantBuffer)[9];
