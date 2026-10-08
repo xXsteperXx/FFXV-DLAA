@@ -815,6 +815,9 @@ static void drawSettings(reshade::api::effect_runtime*)
             reshade::set_config_value(nullptr, "DLAA", "FrameGeneration", frameGeneration);
         }
         ImGui::Text("Frame Generation: %s", fg::frameGenerationStatus.load());
+        if (fg::frameGenerationEnabled && *fg::frameGenerationProblem.load()) {
+            ImGui::Text("Problem: %s", fg::frameGenerationProblem.load());
+        }
         if (fg::multiFrameCountMax.load() > 0) {
             ImGui::Text("Driver limit: up to %u generated frame(s) per real frame", fg::multiFrameCountMax.load());
         }
@@ -1294,7 +1297,14 @@ bool OnDraw(reshade::api::command_list* cmd_list,
         // Frame Generation (DirectX 12 bridge): this frame's depth and motion vectors are shared too.
         taaConstantsCaptureWidth = width;
         taaConstantsCaptureHeight = height;
-        bool shareForFrameGeneration = fg::FrameGenerationWanted() && fg::EnsureFrameInputs(width, height);
+        bool frameGenerationWanted = fg::FrameGenerationWanted();
+        bool shareForFrameGeneration = frameGenerationWanted && fg::EnsureFrameInputs(width, height);
+        if (fg::frameGenerationEnabled && !frameGenerationWanted) {
+            DiagNote(fg::bridgeActive ? "Frame Generation: DirectX 12 device missing" : "Frame Generation: switched on, but the DirectX 12 bridge is not active");
+        }
+        if (frameGenerationWanted && !shareForFrameGeneration) {
+            DiagNote("Frame Generation: depth/motion vectors could not be shared with DirectX 12 (see ReShade.log)");
+        }
 
         {
             ID3D11ShaderResourceView* srvs[] = { inVelocitySRV.get() , inDepthSRV.get() };
@@ -1320,9 +1330,7 @@ bool OnDraw(reshade::api::command_list* cmd_list,
                 fg::ComputeCamera(taaConstants, width, height, fg::frameInputs);
             taaConstantsUsedSerial = taaConstantsSerial;
             fg::frameInputs.valid = cameraOk;
-            if (!cameraOk) {
-                fg::frameGenerationStatus = "waiting: the game's camera data was not found this frame";
-            }
+            fg::frameGenerationProblem = cameraOk ? "" : "the game's camera data was not found (record a frame and send the diagnostic log)";
             DiagOnCamera(cameraOk);
         }
 
