@@ -1,0 +1,71 @@
+name: Build
+
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: windows-latest
+
+    steps:
+      # Baixa o código do repositório e os submódulos (reshade + DLSS),
+      # incluindo o submódulo interno do ReShade (deps/imgui).
+      - name: Baixar o código com os submódulos
+        uses: actions/checkout@v4
+        with:
+          submodules: recursive
+
+      # O pré-build do projeto roda "python.exe embedfile.py".
+      - name: Instalar Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - name: Preparar o MSBuild
+        uses: microsoft/setup-msbuild@v2
+
+      # O pré-build do projeto roda "fxc" (compilador de shaders do Windows SDK).
+      - name: Colocar o fxc.exe no PATH
+        shell: pwsh
+        run: |
+          $fxc = Get-ChildItem "${env:ProgramFiles(x86)}\Windows Kits\10\bin\10.*\x64\fxc.exe" |
+                 Sort-Object { [version]$_.Directory.Parent.Name } -Descending |
+                 Select-Object -First 1
+          if (-not $fxc) { throw "fxc.exe nao encontrado no Windows SDK" }
+          Write-Host "Usando $($fxc.FullName)"
+          Add-Content -Path $env:GITHUB_PATH -Value $fxc.DirectoryName
+
+      # O .vcxproj só reconhece VS 2019 e VS 2022. Aqui escolhemos o toolset
+      # que corresponde ao Visual Studio instalado no servidor do GitHub.
+      - name: Escolher o toolset do Visual Studio
+        shell: pwsh
+        run: |
+          $vswhere = "${env:ProgramFiles(x86)}\Microsoft Visual Studio\Installer\vswhere.exe"
+          $version = & $vswhere -latest -products * -requires Microsoft.VisualStudio.Component.VC.Tools.x86.x64 -property installationVersion
+          $major = [int]($version.Split('.')[0])
+          switch ($major) {
+            16      { $toolset = 'v142' }
+            17      { $toolset = 'v143' }
+            18      { $toolset = 'v145' }
+            default { throw "Versao do Visual Studio nao prevista: $version" }
+          }
+          Write-Host "Visual Studio $version -> toolset $toolset"
+          Add-Content -Path $env:GITHUB_ENV -Value "PLATFORM_TOOLSET=$toolset"
+
+      - name: Compilar FFXV-DLAA.sln (Release x64)
+        shell: pwsh
+        run: |
+          New-Item -ItemType Directory -Force -Path intermediate | Out-Null
+          msbuild FFXV-DLAA.sln /m /nologo /verbosity:minimal `
+            /p:Configuration=Release `
+            /p:Platform=x64 `
+            /p:PlatformToolset=$env:PLATFORM_TOOLSET
+
+      - name: Disponibilizar o DLAA-Inject.addon64 para download
+        uses: actions/upload-artifact@v4
+        with:
+          name: DLAA-Inject
+          path: bin/Release/DLAA-Inject.addon64
+          if-no-files-found: error
