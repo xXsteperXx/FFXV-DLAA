@@ -316,6 +316,68 @@ static void DiagOnPresent(swapchain* swapchain) {
     }
 }
 
+// ---------------------------------------------------------------------------
+// DLSS Super Resolution (used when the game's Resolution Scaling is below 100%).
+//
+// FFXV renders AND post-processes (DOF, bloom, tonemapping) at the reduced
+// resolution, and only then stretches the finished image to the output size
+// with a simple pixel shader (0x1B6C8C68), right before drawing the HUD.
+// In Super Resolution mode we:
+//   1. skip the game's TAA and pass the raw, jittered image through,
+//   2. let the game run its post-processing at the reduced resolution,
+//   3. replace the final stretch with DLSS (low resolution -> output resolution).
+// The HUD is then drawn by the game at full resolution on top of the DLSS output.
+// ---------------------------------------------------------------------------
+constexpr uint32_t kUpscaleShaderHash = 0x1B6C8C68;
+std::set<ID3D11PixelShader*> upscaleShaders;
+
+NVSDK_NGX_Parameter* srParameters = nullptr;
+NVSDK_NGX_Handle* srHandle = nullptr;
+uint32_t srInWidth = 0;
+uint32_t srInHeight = 0;
+uint32_t srOutWidth = 0;
+uint32_t srOutHeight = 0;
+DXGI_FORMAT srOutFormat = DXGI_FORMAT_UNKNOWN;
+com_ptr<ID3D11Texture2D> srOutputTexture;
+
+bool superResolutionEnabled = true;
+std::atomic<uint32_t> outputWidth = 0;  // back buffer size, updated every present
+std::atomic<uint32_t> outputHeight = 0;
+
+// State handed from the TAA pass to the stretch pass within one frame.
+bool srPending = false;
+bool srEvaluatedThisFrame = false;
+bool srNeedReset = true;
+uint32_t srRenderWidth = 0;
+uint32_t srRenderHeight = 0;
+float srJitter[2] = { 0.0f, 0.0f };
+com_ptr<ID3D11Resource> srDepth;
+uint32_t srRetryCooldown = 0; // frames to wait before trying Super Resolution again after a failure
+std::atomic<const char*> srPauseReason = "";
+
+uint32_t mvWidth = 0;
+uint32_t mvHeight = 0;
+
+std::atomic<const char*> dlssStatus = "waiting for the first frame";
+std::atomic<uint32_t> statusInWidth = 0;
+std::atomic<uint32_t> statusInHeight = 0;
+std::atomic<uint32_t> statusOutWidth = 0;
+std::atomic<uint32_t> statusOutHeight = 0;
+
+static void SetStatus(const char* status, uint32_t inW, uint32_t inH, uint32_t outW, uint32_t outH) {
+    dlssStatus = status;
+    statusInWidth = inW;
+    statusInHeight = inH;
+    statusOutWidth = outW;
+    statusOutHeight = outH;
+}
+
+static void DiagNote(const char* text) {
+    if (diagCapturing) {
+        DiagLog(std::string("[DLAA-DIAG]      ") + text);
+    }
+}
+
 void ReleaseDLSS() {
     if (parameters) {
         NVSDK_NGX_D3D11_DestroyParameters(parameters);
@@ -325,12 +387,151 @@ void ReleaseDLSS() {
         NVSDK_NGX_D3D11_ReleaseFeature(dlssHandle);
         dlssHandle = nullptr;
     }
-    motionVectorTexture.reset();
+}
+
+void ReleaseSuperResolution() {
+    if (srParameters) {
+        NVSDK_NGX_D3D11_DestroyParameters(srParameters);
+        srParameters = nullptr;
+    }
+    if (srHandle) {
+        NVSDK_NGX_D3D11_ReleaseFeature(srHandle);
+        srHandle = nullptr;
+    }
+    srOutputTexture.reset();
+    srInWidth = 0;
+    srInHeight = 0;
+    srOutWidth = 0;
+    srOutHeight = 0;
+    srOutFormat = DXGI_FORMAT_UNKNOWN;
+}
+
+static void ReleaseMotionVectors() {
     motionVectorUAV.reset();
+    motionVectorTexture.reset();
+    mvWidth = 0;
+    mvHeight = 0;
+}
+
+static bool EnsureMotionVectorTexture(ID3D11Device* device, uint32_t width, uint32_t height) {
+    if (motionVectorTexture && motionVectorUAV && mvWidth == width && mvHeight == height) {
+        return true;
+    }
+    ReleaseMotionVectors();
+
+    D3D11_TEXTURE2D_DESC motionVectorDesc = {};
+    motionVectorDesc.Width = width;
+    motionVectorDesc.Height = height;
+    motionVectorDesc.Usage = D3D11_USAGE_DEFAULT;
+    motionVectorDesc.ArraySize = 1;
+    motionVectorDesc.Format = DXGI_FORMAT_R16G16_FLOAT;
+    motionVectorDesc.SampleDesc.Count = 1;
+    motionVectorDesc.SampleDesc.Quality = 0;
+    motionVectorDesc.BindFlags = D3D11_BIND_SHADER_RESOURCE | D3D11_BIND_UNORDERED_ACCESS;
+    motionVectorDesc.CPUAccessFlags = 0;
+    motionVectorDesc.MiscFlags = 0;
+    motionVectorDesc.MipLevels = 1;
+    if (FAILED(device->CreateTexture2D(&motionVectorDesc, nullptr, &motionVectorTexture))) {
+        ReleaseMotionVectors();
+        return false;
+    }
+
+    D3D11_UNORDERED_ACCESS_VIEW_DESC uavDesc = {};
+    uavDesc.Format = DXGI_FORMAT_R16G16_FLOAT;
+    uavDesc.ViewDimension = D3D11_UAV_DIMENSION_TEXTURE2D;
+    uavDesc.Texture2D.MipSlice = 0;
+    if (FAILED(device->CreateUnorderedAccessView(motionVectorTexture.get(), &uavDesc, &motionVectorUAV))) {
+        ReleaseMotionVectors();
+        return false;
+    }
+
+    mvWidth = width;
+    mvHeight = height;
+    return true;
+}
+
+// Picks the DLSS quality mode that matches the game's resolution scaling.
+// Only used as a hint: the actual input size is always the game's render size.
+static NVSDK_NGX_PerfQuality_Value QualityForScale(float scale) {
+    if (scale >= 0.99f) return NVSDK_NGX_PerfQuality_Value_DLAA;
+    if (scale >= 0.64f) return NVSDK_NGX_PerfQuality_Value_MaxQuality;
+    if (scale >= 0.55f) return NVSDK_NGX_PerfQuality_Value_Balanced;
+    if (scale >= 0.45f) return NVSDK_NGX_PerfQuality_Value_MaxPerf;
+    return NVSDK_NGX_PerfQuality_Value_UltraPerformance;
+}
+
+static bool EnsureSuperResolution(ID3D11DeviceContext* context, uint32_t inW, uint32_t inH, uint32_t outW, uint32_t outH, DXGI_FORMAT outFormat) {
+    if (srHandle && srOutputTexture &&
+        srInWidth == inW && srInHeight == inH &&
+        srOutWidth == outW && srOutHeight == outH &&
+        srOutFormat == outFormat) {
+        return true;
+    }
+    ReleaseSuperResolution();
+
+    NVSDK_NGX_D3D11_AllocateParameters(&srParameters);
+    if (!srParameters) {
+        return false;
+    }
+    NVSDK_NGX_Parameter_SetUI(srParameters, NVSDK_NGX_Parameter_Width, inW);
+    NVSDK_NGX_Parameter_SetUI(srParameters, NVSDK_NGX_Parameter_Height, inH);
+    NVSDK_NGX_Parameter_SetUI(srParameters, NVSDK_NGX_Parameter_OutWidth, outW);
+    NVSDK_NGX_Parameter_SetUI(srParameters, NVSDK_NGX_Parameter_OutHeight, outH);
+    NVSDK_NGX_Parameter_SetI(srParameters, NVSDK_NGX_Parameter_PerfQualityValue, QualityForScale((float)inW / (float)outW));
+    // The input is already tonemapped (LDR), and motion vectors are at the render resolution.
+    NVSDK_NGX_Parameter_SetI(srParameters, NVSDK_NGX_Parameter_DLSS_Feature_Create_Flags, NVSDK_NGX_DLSS_Feature_Flags_MVLowRes);
+    NVSDK_NGX_Parameter_SetI(srParameters, NVSDK_NGX_Parameter_DLSS_Enable_Output_Subrects, 0);
+    NVSDK_NGX_Parameter_SetUI(srParameters, NVSDK_NGX_Parameter_DLSS_Hint_Render_Preset_DLAA, preset);
+    NVSDK_NGX_Parameter_SetUI(srParameters, NVSDK_NGX_Parameter_DLSS_Hint_Render_Preset_Quality, preset);
+    NVSDK_NGX_Parameter_SetUI(srParameters, NVSDK_NGX_Parameter_DLSS_Hint_Render_Preset_Balanced, preset);
+    NVSDK_NGX_Parameter_SetUI(srParameters, NVSDK_NGX_Parameter_DLSS_Hint_Render_Preset_Performance, preset);
+    NVSDK_NGX_Parameter_SetUI(srParameters, NVSDK_NGX_Parameter_DLSS_Hint_Render_Preset_UltraPerformance, preset);
+
+    NVSDK_NGX_Result result = NVSDK_NGX_D3D11_CreateFeature(context, NVSDK_NGX_Feature_SuperSampling, srParameters, &srHandle);
+    if (NVSDK_NGX_FAILED(result) || !srHandle) {
+        srHandle = nullptr;
+        ReleaseSuperResolution();
+        return false;
+    }
+
+    com_ptr<ID3D11Device> device;
+    context->GetDevice(&device);
+    D3D11_TEXTURE2D_DESC outputDesc = {};
+    outputDesc.Width = outW;
+    outputDesc.Height = outH;
+    outputDesc.MipLevels = 1;
+    outputDesc.ArraySize = 1;
+    outputDesc.Format = outFormat;
+    outputDesc.SampleDesc.Count = 1;
+    outputDesc.Usage = D3D11_USAGE_DEFAULT;
+    outputDesc.BindFlags = D3D11_BIND_SHADER_RESOURCE | D3D11_BIND_UNORDERED_ACCESS;
+    if (FAILED(device->CreateTexture2D(&outputDesc, nullptr, &srOutputTexture))) {
+        ReleaseSuperResolution();
+        return false;
+    }
+
+    srInWidth = inW;
+    srInHeight = inH;
+    srOutWidth = outW;
+    srOutHeight = outH;
+    srOutFormat = outFormat;
+    return true;
+}
+
+// Gives up on Super Resolution for a while (DLAA is used meanwhile).
+static void PauseSuperResolution(const char* reason) {
+    srRetryCooldown = 600;
+    srPending = false;
+    srPauseReason = reason;
+    SetStatus(reason, 0, 0, 0, 0);
+    DiagNote(reason);
 }
 
 void Cleanup() {
     ReleaseDLSS();
+    ReleaseSuperResolution();
+    ReleaseMotionVectors();
+    srDepth.reset();
 
     prepareMotionVectorShader.reset();
 
@@ -403,6 +604,21 @@ static void drawSettings(reshade::api::effect_runtime*)
         reshade::set_config_value(nullptr, "DLAA", "AutoExposure", autoExposure);
         needReinitialize = true;
     }
+    if (ImGui::Checkbox("DLSS Super Resolution when Resolution Scaling < 100%", &superResolutionEnabled))
+    {
+        reshade::set_config_value(nullptr, "DLAA", "SuperResolution", superResolutionEnabled);
+        srRetryCooldown = 0;
+    }
+    if (statusInWidth > 0) {
+        ImGui::Text("Status: %s (%ux%u -> %ux%u)", dlssStatus.load(),
+            statusInWidth.load(), statusInHeight.load(), statusOutWidth.load(), statusOutHeight.load());
+    }
+    else {
+        ImGui::Text("Status: %s", dlssStatus.load());
+    }
+    if (srRetryCooldown > 0) {
+        ImGui::Text("Last Super Resolution problem: %s", srPauseReason.load());
+    }
 
     ImGui::Separator();
     ImGui::TextUnformatted("Diagnostic (for development)");
@@ -431,17 +647,21 @@ void OnInitDevice(reshade::api::device* device) {
         preset = NVSDK_NGX_DLSS_Hint_Render_Preset_K;
     }
     reshade::get_config_value(nullptr, "DLAA", "AutoExposure", autoExposure);
+    reshade::get_config_value(nullptr, "DLAA", "SuperResolution", superResolutionEnabled);
 
     NVSDK_NGX_Result result = NVSDK_NGX_D3D11_Init(1,
         L"",
         (ID3D11Device*)device->get_native());
 
-    if (NVSDK_NGX_FAILED(NVSDK_NGX_Result_Success)) {
+    if (NVSDK_NGX_FAILED(result)) {
+        SetStatus("DLSS could not start (NGX init failed)", 0, 0, 0, 0);
         return;
     }
 
     result = NVSDK_NGX_D3D11_GetCapabilityParameters(&capabilityParameters);
-    if (NVSDK_NGX_FAILED(NVSDK_NGX_Result_Success)) {
+    if (NVSDK_NGX_FAILED(result) || !capabilityParameters) {
+        capabilityParameters = nullptr;
+        SetStatus("DLSS could not start (no capability parameters)", 0, 0, 0, 0);
         return;
     }
 
@@ -528,6 +748,9 @@ void OnInitPipeline(device* device,
         if (shaderHash == 0x0D1CD1AA) {
             sharpenShaders.insert((ID3D11PixelShader*)pipeline.handle);
         }
+        if (shaderHash == kUpscaleShaderHash) {
+            upscaleShaders.insert((ID3D11PixelShader*)pipeline.handle);
+        }
     }
 }
 
@@ -542,9 +765,80 @@ void OnDestroyPipeline(reshade::api::device* device, reshade::api::pipeline pipe
     if (sharpenShaders.find((ID3D11PixelShader*)pipeline.handle) != sharpenShaders.end()) {
         sharpenShaders.erase((ID3D11PixelShader*)pipeline.handle);
     }
+    upscaleShaders.erase((ID3D11PixelShader*)pipeline.handle);
 }
 
-bool OnDraw(reshade::api::command_list* cmd_list, 
+// Replaces the game's final stretch (render resolution -> output resolution) with DLSS.
+// Returns true when the game's draw must be skipped.
+static bool HandleUpscalePass(ID3D11DeviceContext* deviceContext) {
+    com_ptr<ID3D11ShaderResourceView> sourceSRV;
+    deviceContext->PSGetShaderResources(0, 1, &sourceSRV);
+    com_ptr<ID3D11RenderTargetView> targetRTV;
+    deviceContext->OMGetRenderTargets(1, &targetRTV, nullptr);
+    if (!sourceSRV || !targetRTV) {
+        return false;
+    }
+
+    com_ptr<ID3D11Resource> sourceResource;
+    sourceSRV->GetResource(&sourceResource);
+    com_ptr<ID3D11Resource> targetResource;
+    targetRTV->GetResource(&targetResource);
+    com_ptr<ID3D11Texture2D> sourceTexture;
+    com_ptr<ID3D11Texture2D> targetTexture;
+    if (!sourceResource || !targetResource ||
+        FAILED(sourceResource->QueryInterface(&sourceTexture)) || !sourceTexture ||
+        FAILED(targetResource->QueryInterface(&targetTexture)) || !targetTexture) {
+        return false;
+    }
+    D3D11_TEXTURE2D_DESC sourceDesc;
+    sourceTexture->GetDesc(&sourceDesc);
+    D3D11_TEXTURE2D_DESC targetDesc;
+    targetTexture->GetDesc(&targetDesc);
+
+    // Only the stretch of the finished low-resolution image into a bigger target.
+    if (sourceDesc.Width != srRenderWidth || sourceDesc.Height != srRenderHeight ||
+        targetDesc.Width <= srRenderWidth || targetDesc.Height <= srRenderHeight ||
+        targetDesc.SampleDesc.Count != 1) {
+        return false;
+    }
+
+    // The stretch can be issued as more than one draw; DLSS already covered the whole image.
+    if (srEvaluatedThisFrame) {
+        return true;
+    }
+
+    if (!EnsureSuperResolution(deviceContext, srRenderWidth, srRenderHeight, targetDesc.Width, targetDesc.Height, targetDesc.Format)) {
+        PauseSuperResolution("Super Resolution could not start, using DLAA");
+        return false;
+    }
+
+    NVSDK_NGX_D3D11_DLSS_Eval_Params evalParams = {};
+    evalParams.Feature.pInColor = sourceResource.get();
+    evalParams.Feature.pInOutput = srOutputTexture.get();
+    evalParams.pInDepth = srDepth.get();
+    evalParams.pInMotionVectors = motionVectorTexture.get();
+    evalParams.InJitterOffsetX = srJitter[0] * srRenderWidth;
+    evalParams.InJitterOffsetY = srJitter[1] * srRenderHeight;
+    evalParams.InReset = srNeedReset ? 1 : 0;
+    evalParams.InMVScaleX = 1.0f;
+    evalParams.InMVScaleY = 1.0f;
+    evalParams.InRenderSubrectDimensions.Width = srRenderWidth;
+    evalParams.InRenderSubrectDimensions.Height = srRenderHeight;
+    NVSDK_NGX_Result result = NGX_D3D11_EVALUATE_DLSS_EXT(deviceContext, srHandle, srParameters, &evalParams);
+    if (NVSDK_NGX_FAILED(result)) {
+        PauseSuperResolution("Super Resolution failed to run, using DLAA");
+        return false;
+    }
+
+    deviceContext->CopySubresourceRegion(targetResource.get(), 0, 0, 0, 0, srOutputTexture.get(), 0, nullptr);
+
+    srEvaluatedThisFrame = true;
+    SetStatus("DLSS Super Resolution", srRenderWidth, srRenderHeight, targetDesc.Width, targetDesc.Height);
+    DiagNote("Super Resolution: DLSS replaced the game's stretch pass");
+    return true;
+}
+
+bool OnDraw(reshade::api::command_list* cmd_list,
     uint32_t vertex_count,
     uint32_t instance_count,
     uint32_t first_vertex,
@@ -567,75 +861,26 @@ bool OnDraw(reshade::api::command_list* cmd_list,
 
         com_ptr<ID3D11Texture2D> renderTargetTexture;
         renderTargetResource->QueryInterface(&renderTargetTexture);
+        if (!renderTargetTexture) {
+            return false;
+        }
 
         D3D11_TEXTURE2D_DESC renderTargetDesc;
         renderTargetTexture->GetDesc(&renderTargetDesc);
-        
+
         uint32_t width = renderTargetDesc.Width;
         uint32_t height = renderTargetDesc.Height;
 
-        if (currentWidth != width ||
-            currentHeight != height ||
-            needReinitialize) {
+        if (needReinitialize) {
             ReleaseDLSS();
+            ReleaseSuperResolution();
+            needReinitialize = false;
         }
 
-        if (!dlssHandle) {
-            NVSDK_NGX_D3D11_AllocateParameters(&parameters);
-            NVSDK_NGX_Parameter_SetUI(parameters, NVSDK_NGX_Parameter_Width, width);
-            NVSDK_NGX_Parameter_SetUI(parameters, NVSDK_NGX_Parameter_Height, height);
-            NVSDK_NGX_Parameter_SetUI(parameters, NVSDK_NGX_Parameter_OutWidth, width);
-            NVSDK_NGX_Parameter_SetUI(parameters, NVSDK_NGX_Parameter_OutHeight, height);
-            NVSDK_NGX_Parameter_SetI(parameters, NVSDK_NGX_Parameter_PerfQualityValue, NVSDK_NGX_PerfQuality_Value_DLAA);
-            NVSDK_NGX_Parameter_SetI(parameters, NVSDK_NGX_Parameter_DLSS_Feature_Create_Flags, NVSDK_NGX_DLSS_Feature_Flags_IsHDR | (autoExposure ? NVSDK_NGX_DLSS_Feature_Flags_AutoExposure : 0));
-            NVSDK_NGX_Parameter_SetI(parameters, NVSDK_NGX_Parameter_DLSS_Enable_Output_Subrects, 0);
-            NVSDK_NGX_Parameter_SetUI(parameters, NVSDK_NGX_Parameter_DLSS_Hint_Render_Preset_DLAA, preset);
-            NVSDK_NGX_Parameter_SetUI(parameters, NVSDK_NGX_Parameter_DLSS_Hint_Render_Preset_Quality, preset);
-            NVSDK_NGX_Parameter_SetUI(parameters, NVSDK_NGX_Parameter_DLSS_Hint_Render_Preset_Balanced, preset);
-            NVSDK_NGX_Parameter_SetUI(parameters, NVSDK_NGX_Parameter_DLSS_Hint_Render_Preset_Performance, preset);
-            NVSDK_NGX_Parameter_SetUI(parameters, NVSDK_NGX_Parameter_DLSS_Hint_Render_Preset_UltraPerformance, preset);
-            NVSDK_NGX_Result result = NVSDK_NGX_D3D11_CreateFeature(deviceContext, NVSDK_NGX_Feature_SuperSampling, parameters, &dlssHandle);
-            if (NVSDK_NGX_FAILED(result)) {
-                dlssHandle = nullptr;
-                dlssAvailable = false;
-                return false;
-            }
-
-            com_ptr<ID3D11Device> device;
-            deviceContext->GetDevice(&device);
-
-            {
-                D3D11_TEXTURE2D_DESC motionVectorDesc;
-                motionVectorDesc.Width = width;
-                motionVectorDesc.Height = height;
-                motionVectorDesc.Usage = D3D11_USAGE_DEFAULT;
-                motionVectorDesc.ArraySize = 1;
-                motionVectorDesc.Format = DXGI_FORMAT_R16G16_FLOAT;
-                motionVectorDesc.SampleDesc.Count = 1;
-                motionVectorDesc.SampleDesc.Quality = 0;
-                motionVectorDesc.BindFlags = D3D11_BIND_SHADER_RESOURCE | D3D11_BIND_UNORDERED_ACCESS;
-                motionVectorDesc.CPUAccessFlags = 0;
-                motionVectorDesc.MiscFlags = 0;
-                motionVectorDesc.MipLevels = 1;
-
-                device->CreateTexture2D(&motionVectorDesc,
-                    nullptr,
-                    &motionVectorTexture);
-            }
-            {
-                D3D11_UNORDERED_ACCESS_VIEW_DESC uavDesc;
-                uavDesc.Format = DXGI_FORMAT_R16G16_FLOAT;
-                uavDesc.ViewDimension = D3D11_UAV_DIMENSION_TEXTURE2D;
-                uavDesc.Texture2D.MipSlice = 0;
-
-                device->CreateUnorderedAccessView(motionVectorTexture.get(),
-                    &uavDesc,
-                    &motionVectorUAV);
-            }
-
-            currentWidth = width;
-            currentHeight = height;
-            needReinitialize = false;
+        com_ptr<ID3D11Device> device;
+        deviceContext->GetDevice(&device);
+        if (!EnsureMotionVectorTexture(device.get(), width, height)) {
+            return false;
         }
 
         com_ptr<ID3D11Buffer> cbTemporalAA;
@@ -677,6 +922,68 @@ bool OnDraw(reshade::api::command_list* cmd_list,
             srvs[0] = nullptr;
             srvs[1] = nullptr;
             deviceContext->CSSetShaderResources(0, 2, srvs);
+            uavs[0] = nullptr;
+            deviceContext->CSSetUnorderedAccessViews(0, 1, uavs, nullptr);
+        }
+
+        // Super Resolution: the game renders below the output size, so DLSS runs later,
+        // in place of the game's final stretch. Here we only pass the raw image through.
+        uint32_t outW = outputWidth;
+        uint32_t outH = outputHeight;
+        if (superResolutionEnabled && srRetryCooldown == 0 && outW > width && outH > height) {
+            com_ptr<ID3D11Texture2D> inColorTexture;
+            inColor->QueryInterface(&inColorTexture);
+            D3D11_TEXTURE2D_DESC inColorDesc = {};
+            if (inColorTexture) {
+                inColorTexture->GetDesc(&inColorDesc);
+            }
+            if (inColorTexture &&
+                inColorDesc.Width == width && inColorDesc.Height == height &&
+                inColorDesc.Format == renderTargetDesc.Format &&
+                inColorDesc.SampleDesc.Count == 1 && renderTargetDesc.SampleDesc.Count == 1) {
+                deviceContext->CopySubresourceRegion(renderTargetResource.get(), 0, 0, 0, 0, inColor.get(), 0, nullptr);
+                srDepth = inDepth;
+                srRenderWidth = width;
+                srRenderHeight = height;
+                srJitter[0] = jitter[0];
+                srJitter[1] = jitter[1];
+                srPending = true;
+                DiagNote("Super Resolution: TAA skipped, raw image passed through");
+                return true;
+            }
+            PauseSuperResolution("Super Resolution not possible here (TAA formats differ), using DLAA");
+        }
+
+        // DLAA: replaces the game's TAA at the same resolution (original behaviour of the mod).
+        if (currentWidth != width ||
+            currentHeight != height) {
+            ReleaseDLSS();
+        }
+
+        if (!dlssHandle) {
+            NVSDK_NGX_D3D11_AllocateParameters(&parameters);
+            NVSDK_NGX_Parameter_SetUI(parameters, NVSDK_NGX_Parameter_Width, width);
+            NVSDK_NGX_Parameter_SetUI(parameters, NVSDK_NGX_Parameter_Height, height);
+            NVSDK_NGX_Parameter_SetUI(parameters, NVSDK_NGX_Parameter_OutWidth, width);
+            NVSDK_NGX_Parameter_SetUI(parameters, NVSDK_NGX_Parameter_OutHeight, height);
+            NVSDK_NGX_Parameter_SetI(parameters, NVSDK_NGX_Parameter_PerfQualityValue, NVSDK_NGX_PerfQuality_Value_DLAA);
+            NVSDK_NGX_Parameter_SetI(parameters, NVSDK_NGX_Parameter_DLSS_Feature_Create_Flags, NVSDK_NGX_DLSS_Feature_Flags_IsHDR | (autoExposure ? NVSDK_NGX_DLSS_Feature_Flags_AutoExposure : 0));
+            NVSDK_NGX_Parameter_SetI(parameters, NVSDK_NGX_Parameter_DLSS_Enable_Output_Subrects, 0);
+            NVSDK_NGX_Parameter_SetUI(parameters, NVSDK_NGX_Parameter_DLSS_Hint_Render_Preset_DLAA, preset);
+            NVSDK_NGX_Parameter_SetUI(parameters, NVSDK_NGX_Parameter_DLSS_Hint_Render_Preset_Quality, preset);
+            NVSDK_NGX_Parameter_SetUI(parameters, NVSDK_NGX_Parameter_DLSS_Hint_Render_Preset_Balanced, preset);
+            NVSDK_NGX_Parameter_SetUI(parameters, NVSDK_NGX_Parameter_DLSS_Hint_Render_Preset_Performance, preset);
+            NVSDK_NGX_Parameter_SetUI(parameters, NVSDK_NGX_Parameter_DLSS_Hint_Render_Preset_UltraPerformance, preset);
+            NVSDK_NGX_Result result = NVSDK_NGX_D3D11_CreateFeature(deviceContext, NVSDK_NGX_Feature_SuperSampling, parameters, &dlssHandle);
+            if (NVSDK_NGX_FAILED(result)) {
+                dlssHandle = nullptr;
+                dlssAvailable = false;
+                SetStatus("DLSS could not start (create feature failed)", 0, 0, 0, 0);
+                return false;
+            }
+
+            currentWidth = width;
+            currentHeight = height;
         }
 
         {
@@ -696,13 +1003,19 @@ bool OnDraw(reshade::api::command_list* cmd_list,
         }
 
         invokedThisFrame = true;
+        SetStatus("DLAA", width, height, width, height);
         return true;
+    }
+    else if (srPending && upscaleShaders.find(shader.get()) != upscaleShaders.end()) {
+        return HandleUpscalePass(deviceContext);
     }
     else if (sharpenShaders.find(shader.get()) != sharpenShaders.end()) {
         {
             D3D11_MAPPED_SUBRESOURCE mappedResource;
             if (SUCCEEDED(deviceContext->Map(cbSharpenModify.get(), 0, D3D11_MAP_WRITE_DISCARD, 0, &mappedResource))) {
-                ((float*)mappedResource.pData)[0] = sharpenMultiplier;
+                // In Super Resolution mode the image is not anti-aliased yet at this point:
+                // sharpening it would only amplify aliasing, so the game's sharpen is turned off.
+                ((float*)mappedResource.pData)[0] = srPending ? 0.0f : sharpenMultiplier;
                 deviceContext->Unmap(cbSharpenModify.get(), 0);
             }
         }
@@ -764,6 +1077,28 @@ void OnPresent(command_queue* queue,
     const rect* dirty_rects) {
     needReset = !invokedThisFrame;
     invokedThisFrame = false;
+
+    // TAA was skipped for Super Resolution but the game's stretch pass never came:
+    // this scene does not use it, so fall back to DLAA for a while.
+    if (srPending && !srEvaluatedThisFrame) {
+        PauseSuperResolution("Super Resolution: stretch pass not found in this scene, using DLAA");
+    }
+    srNeedReset = !srEvaluatedThisFrame;
+    srPending = false;
+    srEvaluatedThisFrame = false;
+    srDepth.reset();
+    if (srRetryCooldown > 0) {
+        srRetryCooldown--;
+    }
+
+    // Output size = back buffer size.
+    resource backBuffer = swapchain->get_current_back_buffer();
+    if (backBuffer.handle != 0) {
+        resource_desc backBufferDesc = swapchain->get_device()->get_resource_desc(backBuffer);
+        outputWidth = backBufferDesc.texture.width;
+        outputHeight = backBufferDesc.texture.height;
+    }
+
     DiagOnPresent(swapchain);
 }
 
@@ -773,7 +1108,15 @@ bool OnDrawIndexed(reshade::api::command_list* cmd_list,
     uint32_t first_index,
     int32_t vertex_offset,
     uint32_t first_instance) {
-    DiagOnGpuWork((ID3D11DeviceContext*)(cmd_list->get_native()), false);
+    ID3D11DeviceContext* deviceContext = (ID3D11DeviceContext*)(cmd_list->get_native());
+    DiagOnGpuWork(deviceContext, false);
+    if (srPending) {
+        com_ptr<ID3D11PixelShader> shader;
+        deviceContext->PSGetShader(&shader, nullptr, nullptr);
+        if (upscaleShaders.find(shader.get()) != upscaleShaders.end()) {
+            return HandleUpscalePass(deviceContext);
+        }
+    }
     return false;
 }
 
