@@ -48,6 +48,7 @@
 #include "latencyflex.h"
 #pragma pop_macro("max")
 #pragma pop_macro("min")
+#include "mfg_unlock.hpp"
 #include <atomic>
 #include <cmath>
 #include <condition_variable>
@@ -71,6 +72,8 @@ inline std::atomic<bool> frameGenerationEnabled = false; // config [DLAA] FrameG
 inline std::atomic<const char*> frameGenerationStatus = "off";
 inline std::atomic<bool> frameGenerationRunning = false;
 inline std::atomic<bool> frameGenerationRetry = false;  // set by the menu when Frame Generation is switched on
+inline std::atomic<int> frameGenerationMultiplier = 2;  // config [DLAA] FGMultiplier: 2x, 3x or 4x
+inline std::atomic<int> activeMultiplier = 0;           // multiplier really running (0 = none)
 inline std::atomic<const char*> frameGenerationProblem = ""; // last problem preparing the inputs (kept until fixed)
 
 // Latency settings (menu)
@@ -826,6 +829,30 @@ inline uint32_t fgRenderWidth = 0;
 inline uint32_t fgRenderHeight = 0;
 inline DXGI_FORMAT fgFormat = DXGI_FORMAT_UNKNOWN;
 
+inline void LogUnlock(const char* format, ...) {
+    char buffer[600];
+    va_list args;
+    va_start(args, format);
+    vsnprintf(buffer, sizeof(buffer), format, args);
+    va_end(args);
+    Log(reshade::log::level::info, "%s", buffer);
+}
+
+inline unsigned int QueryMultiFrameCountMax(int& available, int& needsUpdatedDriver) {
+    NVSDK_NGX_Parameter* caps = nullptr;
+    unsigned int mfgMax = 0;
+    available = 0;
+    needsUpdatedDriver = 0;
+    if (NVSDK_NGX_FAILED(NVSDK_NGX_D3D12_GetCapabilityParameters(&caps)) || !caps) {
+        return 0;
+    }
+    caps->Get(NVSDK_NGX_Parameter_FrameGeneration_Available, &available);
+    caps->Get(NVSDK_NGX_Parameter_FrameInterpolation_NeedsUpdatedDriver, &needsUpdatedDriver);
+    caps->Get(NVSDK_NGX_DLSSG_Parameter_MultiFrameCountMax, &mfgMax);
+    NVSDK_NGX_D3D12_DestroyParameters(caps);
+    return mfgMax;
+}
+
 inline bool InitNGX12() {
     if (ngx12InitTried) {
         return ngx12Available;
@@ -835,20 +862,38 @@ inline bool InitNGX12() {
         frameGenerationStatus = "unavailable: NGX could not start on DirectX 12";
         return false;
     }
-    NVSDK_NGX_Parameter* caps = nullptr;
-    if (NVSDK_NGX_FAILED(NVSDK_NGX_D3D12_GetCapabilityParameters(&caps)) || !caps) {
-        frameGenerationStatus = "unavailable: no NGX capabilities";
-        return false;
-    }
     int available = 0;
     int needsUpdatedDriver = 0;
-    unsigned int mfgMax = 0;
-    caps->Get(NVSDK_NGX_Parameter_FrameGeneration_Available, &available);
-    caps->Get(NVSDK_NGX_Parameter_FrameInterpolation_NeedsUpdatedDriver, &needsUpdatedDriver);
-    caps->Get(NVSDK_NGX_DLSSG_Parameter_MultiFrameCountMax, &mfgMax);
-    NVSDK_NGX_D3D12_DestroyParameters(caps);
-    multiFrameCountMax = mfgMax;
+    unsigned int mfgMax = QueryMultiFrameCountMax(available, needsUpdatedDriver);
     Log(reshade::log::level::info, "DLSS Frame Generation available=%d, needs newer driver=%d, MultiFrameCountMax=%u.", available, needsUpdatedDriver, mfgMax);
+    int newlyPatched = 0;
+    if (available && mfgMax > 1) {
+        mfg::status = "not needed (this GPU supports it)";
+    }
+    else if (available) {
+        // Multi Frame Generation unlock (RTX 40): patch the loaded DLSS-G provider, then ask again.
+        newlyPatched = mfg::PatchLoadedProviders(LogUnlock);
+    }
+    if (available && mfgMax <= 1 && newlyPatched > 0) {
+        // The provider was loaded and asked before it could be patched: ask again, and if
+        // needed restart NGX on DirectX 12 (the provider stays loaded and patched).
+        mfgMax = QueryMultiFrameCountMax(available, needsUpdatedDriver);
+        if (mfgMax <= 1) {
+            NVSDK_NGX_D3D12_Shutdown1(device12.get());
+            if (NVSDK_NGX_FAILED(NVSDK_NGX_D3D12_Init(1, L"", device12.get()))) {
+                frameGenerationStatus = "unavailable: NGX could not restart on DirectX 12";
+                return false;
+            }
+            mfg::PatchLoadedProviders(LogUnlock); // patches again if the provider was reloaded
+            mfgMax = QueryMultiFrameCountMax(available, needsUpdatedDriver);
+        }
+        Log(reshade::log::level::info, "After the MFG unlock: MultiFrameCountMax=%u (provider patched now: %s).", mfgMax,
+            mfg::AnyProviderPatched() ? "yes" : "no");
+    }
+    if (!mfg::AnyProviderPatched() && strcmp(mfg::status.load(), "not checked yet") == 0) {
+        mfg::status = "nvngx_dlssg.dll not found among the loaded modules";
+    }
+    multiFrameCountMax = mfgMax;
     if (!available) {
         frameGenerationStatus = needsUpdatedDriver ? "unavailable: update the NVIDIA driver"
                                                    : "unavailable: check nvngx_dlssg.dll in the game folder, RTX 40+ GPU, Hardware-accelerated GPU scheduling";
@@ -1088,6 +1133,7 @@ public:
 private:
     static constexpr int kRingSize = 3;
     static constexpr int kSlots = 3;
+    static constexpr int kMaxGenerated = 3; // 4x
 
     // Command allocators + list used by one thread on one queue.
     struct CommandRing {
@@ -1100,7 +1146,7 @@ private:
 
     // One frame handed to the presenter thread: generated frame + copy of the real frame.
     struct Slot {
-        com_ptr<ID3D12Resource> generated; // UNORDERED_ACCESS state
+        com_ptr<ID3D12Resource> generated[kMaxGenerated]; // UNORDERED_ACCESS state
         com_ptr<ID3D12Resource> real;      // UNORDERED_ACCESS state
         uint64_t freeFence = 0;            // presentFence12 value after the last copy out of this slot
         bool queued = false;               // guarded by _slotMutex
@@ -1108,7 +1154,7 @@ private:
 
     struct Job {
         int slot;
-        bool hasGenerated;
+        int generatedCount;      // generated frames in this slot (0 = only the real frame)
         UINT syncInterval;
         UINT flags;
         uint64_t workDone;       // fence12 value: the GPU finished this frame (generated + real frame ready)
@@ -1224,7 +1270,9 @@ private:
 
     void ReleaseSlots() {
         for (Slot& slot : _slots) {
-            slot.generated.reset();
+            for (com_ptr<ID3D12Resource>& texture : slot.generated) {
+                texture.reset();
+            }
             slot.real.reset();
             slot.freeFence = 0;
             slot.queued = false;
@@ -1273,13 +1321,23 @@ private:
 
     // Output textures of Frame Generation (same size/format as the back buffer).
     bool EnsureSlots() {
-        if (_slots[0].generated && _slots[0].real) {
+        const int needed = GeneratedFramesWanted();
+        if (_slots[0].generated[needed - 1] && _slots[0].real) {
             return true;
         }
         for (Slot& slot : _slots) {
-            if (!CreateTexture12(_gameDesc.BufferDesc.Width, _gameDesc.BufferDesc.Height, _gameDesc.BufferDesc.Format,
-                    D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS, D3D12_HEAP_FLAG_NONE, D3D12_RESOURCE_STATE_UNORDERED_ACCESS, slot.generated) ||
-                !CreateTexture12(_gameDesc.BufferDesc.Width, _gameDesc.BufferDesc.Height, _gameDesc.BufferDesc.Format,
+            for (int i = 0; i < needed; ++i) {
+                com_ptr<ID3D12Resource>& texture = slot.generated[i];
+                if (texture) {
+                    continue; // only new textures are created; existing ones may be in use
+                }
+                if (!CreateTexture12(_gameDesc.BufferDesc.Width, _gameDesc.BufferDesc.Height, _gameDesc.BufferDesc.Format,
+                        D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS, D3D12_HEAP_FLAG_NONE, D3D12_RESOURCE_STATE_UNORDERED_ACCESS, texture)) {
+                    ReleaseSlots();
+                    return false;
+                }
+            }
+            if (!slot.real && !CreateTexture12(_gameDesc.BufferDesc.Width, _gameDesc.BufferDesc.Height, _gameDesc.BufferDesc.Format,
                     D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS, D3D12_HEAP_FLAG_NONE, D3D12_RESOURCE_STATE_UNORDERED_ACCESS, slot.real)) {
                 ReleaseSlots();
                 return false;
@@ -1555,6 +1613,7 @@ private:
         }
         if (!throughPresenter) {
             frameGenerationRunning = false;
+            activeMultiplier = 0;
             _frameGenerationWasRunning = false;
             DrainPresenter();
             hr = PresentDirect(syncInterval, flags, submitted);
@@ -1601,6 +1660,26 @@ private:
             Log(reshade::log::level::warning, "Present failed (0x%08X).", (unsigned)hr);
         }
         return hr;
+    }
+
+    // Generated frames per real frame: the menu choice, limited by what the driver allows
+    // (after the Multi Frame Generation unlock it allows up to 3 = 4x).
+    int GeneratedFramesWanted() {
+        int wanted = frameGenerationMultiplier - 1;
+        if (wanted < 1) {
+            wanted = 1;
+        }
+        if (wanted > kMaxGenerated) {
+            wanted = kMaxGenerated;
+        }
+        int allowed = (int)multiFrameCountMax.load();
+        if (allowed <= 1 && mfg::AnyProviderPatched()) {
+            allowed = kMaxGenerated; // unlocked after NGX asked: try, falls back to 2x on failure
+        }
+        if (_multiFrameFailed || allowed < 1) {
+            allowed = 1;
+        }
+        return wanted < allowed ? wanted : allowed;
     }
 
     // Frame Generation on: generate the in-between frame (when 'generate' and possible) and hand
@@ -1651,6 +1730,7 @@ private:
 
         uint64_t gameFrameDone = SignalFromD3D11();
         bool generated = false;
+        int generatedCount = 0;
         bool createdThisFrame = false;
         uint64_t workDone;
         {
@@ -1701,40 +1781,55 @@ private:
                     }
                 }
 
-                NVSDK_NGX_D3D12_DLSSG_Eval_Params evalParams = {};
-                evalParams.pBackbuffer = _shared12.get();
-                evalParams.pDepth = depthShared.resource12.get();
-                evalParams.pMVecs = motionShared.resource12.get();
-                evalParams.pHudless = inputs.hudlessValid ? hudlessShared.resource12.get() : nullptr;
-                evalParams.pOutputInterpFrame = slot.generated.get();
-                evalParams.pOutputRealFrame = slot.real.get();
+                // 2x = 1 generated frame, 3x = 2, 4x = 3: one evaluation per generated frame.
+                const int count = GeneratedFramesWanted();
+                const bool reset = !_frameGenerationWasRunning || count != _lastGeneratedCount;
+                for (int index = 1; index <= count; ++index) {
+                    NVSDK_NGX_D3D12_DLSSG_Eval_Params evalParams = {};
+                    evalParams.pBackbuffer = _shared12.get();
+                    evalParams.pDepth = depthShared.resource12.get();
+                    evalParams.pMVecs = motionShared.resource12.get();
+                    evalParams.pHudless = inputs.hudlessValid ? hudlessShared.resource12.get() : nullptr;
+                    evalParams.pOutputInterpFrame = slot.generated[index - 1].get();
+                    evalParams.pOutputRealFrame = slot.real.get();
 
-                NVSDK_NGX_DLSSG_Opt_Eval_Params optParams = {};
-                optParams.multiFrameCount = 1;
-                optParams.multiFrameIndex = 1;
-                CopyMatrixForDLSS(inputs.viewToClip, optParams.cameraViewToClip);
-                CopyMatrixForDLSS(inputs.clipToView, optParams.clipToCameraView);
-                CopyMatrixForDLSS(inputs.clipToPrevClip, optParams.clipToPrevClip);
-                CopyMatrixForDLSS(inputs.prevClipToClip, optParams.prevClipToClip);
-                for (int i = 0; i < 4; ++i) {
-                    optParams.clipToLensClip[i][i] = 1.0f;
+                    NVSDK_NGX_DLSSG_Opt_Eval_Params optParams = {};
+                    optParams.multiFrameCount = (unsigned int)count;
+                    optParams.multiFrameIndex = (unsigned int)index;
+                    CopyMatrixForDLSS(inputs.viewToClip, optParams.cameraViewToClip);
+                    CopyMatrixForDLSS(inputs.clipToView, optParams.clipToCameraView);
+                    CopyMatrixForDLSS(inputs.clipToPrevClip, optParams.clipToPrevClip);
+                    CopyMatrixForDLSS(inputs.prevClipToClip, optParams.prevClipToClip);
+                    for (int i = 0; i < 4; ++i) {
+                        optParams.clipToLensClip[i][i] = 1.0f;
+                    }
+                    optParams.mvecScale[0] = 1.0f;
+                    optParams.mvecScale[1] = 1.0f;
+                    optParams.cameraUp[1] = 1.0f;
+                    optParams.cameraRight[0] = 1.0f;
+                    optParams.cameraFwd[2] = 1.0f;
+                    optParams.cameraNear = inputs.nearPlane;
+                    optParams.cameraFar = inputs.farPlane;
+                    optParams.cameraFOV = inputs.fov;
+                    optParams.cameraAspectRatio = inputs.aspect;
+                    optParams.colorBuffersHDR = false;
+                    optParams.depthInverted = inputs.depthInverted;
+                    optParams.cameraMotionIncluded = true;
+                    optParams.reset = reset;
+                    optParams.menuDetectionEnabled = true;
+
+                    if (NVSDK_NGX_FAILED(NGX_D3D12_EVALUATE_DLSSG(list, fgHandle, fgParameters, &evalParams, &optParams))) {
+                        if (count > 1) {
+                            // Multi Frame Generation refused: continue with 2x for this session.
+                            _multiFrameFailed = true;
+                            Log(reshade::log::level::error, "DLSS Multi Frame Generation (%dx) evaluation %d failed; using 2x from now on.", count + 1, index);
+                        }
+                        break;
+                    }
+                    generatedCount = index;
                 }
-                optParams.mvecScale[0] = 1.0f;
-                optParams.mvecScale[1] = 1.0f;
-                optParams.cameraUp[1] = 1.0f;
-                optParams.cameraRight[0] = 1.0f;
-                optParams.cameraFwd[2] = 1.0f;
-                optParams.cameraNear = inputs.nearPlane;
-                optParams.cameraFar = inputs.farPlane;
-                optParams.cameraFOV = inputs.fov;
-                optParams.cameraAspectRatio = inputs.aspect;
-                optParams.colorBuffersHDR = false;
-                optParams.depthInverted = inputs.depthInverted;
-                optParams.cameraMotionIncluded = true;
-                optParams.reset = !_frameGenerationWasRunning;
-                optParams.menuDetectionEnabled = true;
-
-                generated = NVSDK_NGX_SUCCEED(NGX_D3D12_EVALUATE_DLSSG(list, fgHandle, fgParameters, &evalParams, &optParams));
+                generated = generatedCount > 0;
+                _lastGeneratedCount = count;
 
                 for (ID3D12Resource* resource : readInputs) {
                     if (resource) {
@@ -1760,14 +1855,19 @@ private:
         submitted = workDone;
 
         if (generated) {
+            static const char* runningNames[] = { "running (2x)", "running (3x)", "running (4x)" };
             frameGenerationRunning = true;
-            frameGenerationStatus = "running (2x)";
+            frameGenerationStatus = runningNames[generatedCount - 1];
+            activeMultiplier = generatedCount + 1;
             statGenerated++;
         }
         else {
             statNotGenerated++;
             if (generate && createdThisFrame) {
                 statLastSkipReason = "Frame Generation was (re)created this frame";
+            }
+            else if (generate && fgHandle && _multiFrameFailed && _lastGeneratedCount > 1) {
+                statLastSkipReason = "Multi Frame Generation evaluation failed (now 2x)";
             }
             else if (generate && fgHandle) {
                 statLastSkipReason = "evaluation failed";
@@ -1791,7 +1891,7 @@ private:
         _watchCv.notify_one();
         {
             std::lock_guard<std::mutex> lock(_jobMutex);
-            _jobs.push_back(Job{ slotIndex, generated, syncInterval, flags, workDone, _latencyFrameId, _pacingResetPending, sequence });
+            _jobs.push_back(Job{ slotIndex, generatedCount, syncInterval, flags, workDone, _latencyFrameId, _pacingResetPending, sequence });
         }
         _pacingResetPending = false;
         _jobCv.notify_all();
@@ -1813,8 +1913,12 @@ private:
 
     // Copies a slot texture (UNORDERED_ACCESS state) into the back buffer, waits until the copy
     // is finished and until 'target' (QPC, 0 = now), then presents. Returns the copy's fence value.
-    uint64_t ShowTexture(ID3D12Resource* source, const Job& job, int64_t target, bool stopWhenNextFrameReady) {
-        WaitForDisplaySlot();
+    uint64_t ShowTexture(ID3D12Resource* source, const Job& job, int64_t target, bool stopWhenNextFrameReady, bool* stoppedEarly = nullptr) {
+        // One display slot per Present: after a skipped frame the slot is still ours.
+        if (!_displaySlotHeld) {
+            WaitForDisplaySlot();
+        }
+        _displaySlotHeld = false;
         uint64_t copied;
         UINT copiedIndex;
         {
@@ -1851,6 +1955,15 @@ private:
             });
             if (early) {
                 statLateFrames++;
+            }
+            if (stoppedEarly) {
+                *stoppedEarly = early;
+                if (early) {
+                    _displaySlotHeld = true;
+                    // Running late: this generated frame is not shown (the next copy simply
+                    // overwrites the same back buffer, it only advances on Present).
+                    return copied;
+                }
             }
         }
         HRESULT hr = S_OK;
@@ -1901,35 +2014,39 @@ private:
             }
             _frameTimes.Add(finished);
 
-            // 2) Half the time between finished frames, a little less when it varies
-            //    (showing the real frame slightly early is better than late).
-            int64_t halfFrame = 0;
+            // 2) The time between finished frames, split evenly between the generated frames and
+            //    the real frame (half a frame for 2x, a quarter for 4x), a little less when it
+            //    varies (showing frames slightly early is better than late).
+            const int generatedCount = job.generatedCount;
+            int64_t step = 0;
             double mean = 0.0;
             double deviation = 0.0;
             if (_frameTimes.Get(mean, deviation)) {
                 statFrameTimeMs = (float)(mean * 1000.0);
                 statFrameJitterMs = (float)(deviation * 1000.0);
-                double half = mean * 0.5 - deviation * 0.25 - 0.0001;
-                if (half > 0.05) {
-                    half = 0.05;
-                }
-                if (half > 0.0) {
-                    halfFrame = SecondsToQpc(half);
+                if (generatedCount > 0) {
+                    double interval = (mean - deviation * 0.5) / (double)(generatedCount + 1) - 0.0001;
+                    if (interval > 0.05) {
+                        interval = 0.05;
+                    }
+                    if (interval > 0.0) {
+                        step = SecondsToQpc(interval);
+                    }
                 }
             }
             // With V-Sync the display itself spaces the frames.
-            const bool paced = job.syncInterval == 0 && halfFrame > 0 && _lastPresentQpc != 0;
+            const bool paced = job.syncInterval == 0 && step > 0 && _lastPresentQpc != 0;
 
             uint64_t lastCopy = 0;
-            if (job.hasGenerated) {
-                // Generated frame: as soon as it is ready, but not closer than half a frame to the previous frame.
-                lastCopy = ShowTexture(slot.generated.get(), job, paced ? _lastPresentQpc + halfFrame : 0, false);
-                // Real frame: half a frame after the generated one (sooner if the next frame is already done).
-                lastCopy = ShowTexture(slot.real.get(), job, paced ? _lastPresentQpc + halfFrame : 0, true);
+            bool late = false;
+            for (int index = 0; index < generatedCount && !late; ++index) {
+                // First generated frame: as soon as it is ready, but not closer than one step to
+                // the previous frame. The next ones one step apart; if the next real frame is
+                // already done (running late), the remaining generated frames are skipped.
+                lastCopy = ShowTexture(slot.generated[index].get(), job, paced ? _lastPresentQpc + step : 0, index > 0, &late);
             }
-            else {
-                lastCopy = ShowTexture(slot.real.get(), job, 0, false);
-            }
+            // Real frame: one step after the last generated frame (sooner if the next frame is already done).
+            lastCopy = ShowTexture(slot.real.get(), job, (paced && !late) ? _lastPresentQpc + step : 0, generatedCount > 0);
 
             {
                 std::lock_guard<std::mutex> lock(_slotMutex);
@@ -2016,9 +2133,12 @@ private:
 
     bool _frameGenerationWasRunning = false;
     bool _frameGenerationFailed = false;
+    bool _multiFrameFailed = false;   // 3x/4x refused by DLSS: 2x for this session
+    int _lastGeneratedCount = 0;
 
     // Pacing (presenter thread)
     FrameTimeEstimator _frameTimes;
+    bool _displaySlotHeld = false;   // presenter thread
     int64_t _lastPresentQpc = 0;
     bool _pacingResetPending = true; // render thread, handed over with the next job
 
